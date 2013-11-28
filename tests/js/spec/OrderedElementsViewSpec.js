@@ -1,7 +1,7 @@
 function make_group(data) {
   data = data || {};
 
-  return new app.models.Group({
+  return {
     id: data.id || 1,
     score: data.score || 5,
     count: 1,
@@ -14,8 +14,9 @@ function make_group(data) {
     canResolve: false,
     logger: 'root',
     versions: [],
-    tags: []
-  });
+    tags: [],
+    version: 0
+  };
 }
 
 describe("OrderedElementsView", function() {
@@ -24,6 +25,29 @@ describe("OrderedElementsView", function() {
   var group2;
   var group3;
   var group4;
+  var member;
+  var TestModel;
+
+  it("maintains correct models", function() {
+      TestModel = Backbone.Model.extend({
+          defaults: {foo: "bar"}
+      });
+
+      view = new app.OrderedElementsView({
+          id: 'foo',
+          model: TestModel
+      });
+      view.$parent = $('<ul></ul>');
+
+      view.addMember({
+        id: 1,
+        biz: "baz"
+      });
+
+      member = view.collection.get(1)
+      assert.equal(member.get("biz"), "baz");
+      assert.equal(member.get("foo"), "bar");
+  });
 
   describe("without initial members", function() {
     beforeEach(function() {
@@ -34,11 +58,11 @@ describe("OrderedElementsView", function() {
     });
 
     it("should suggest its not loaded", function() {
-      expect(view.loaded).toBe(false);
+      assert.isFalse(view.loaded);
     });
 
     it("has status text to loading", function() {
-      expect(view.$empty.html()).toBe(view.loadingMessage);
+      assert.equal(view.$empty.html(), view.loadingMessage);
     });
   });
 
@@ -52,11 +76,11 @@ describe("OrderedElementsView", function() {
     });
 
     it("should suggest its loaded", function() {
-      expect(view.loaded).toBe(true);
+      assert.isTrue(view.loaded);
     });
 
     it("has status text to loading", function() {
-      expect(view.$empty.html()).not.toBe(view.loadingMessage);
+      assert.notEqual(view.$empty.html(), view.loadingMessage);
     });
   });
 
@@ -68,21 +92,20 @@ describe("OrderedElementsView", function() {
         view = new app.OrderedElementsView({
             id: 'foo'
         });
-        view.collection.reset = sinon.spy();
+        view.collection.reset = this.sinon.spy();
         view.reset([group1]);
       });
 
       it("calls collection.reset with data", function() {
-        expect(view.collection.reset.called).toBe(true);
-        expect(view.collection.reset.calledWithExactly([group1])).toBe(true);
+        assert.isTrue(view.collection.reset.calledOnce);
       });
 
       it("suggests its loaded", function() {
-        expect(view.loaded).toBe(true);
+        assert.isTrue(view.loaded);
       });
 
       it("changes status text to empty", function() {
-        expect(view.$empty.html()).toBe(view.emptyMessage);
+        assert.equal(view.$empty.html(), view.emptyMessage);
       });
     });
 
@@ -92,21 +115,21 @@ describe("OrderedElementsView", function() {
             id: 'foo'
         });
         group1 = make_group({id: 1, score: 3});
-        view.collection.reset = sinon.spy();
+        view.collection.reset = this.sinon.spy();
         view.reset([]);
       });
 
       it("calls collection.reset with data", function() {
-        expect(view.collection.reset.called).toBe(true);
-        expect(view.collection.reset.calledWithExactly([])).toBe(true);
+        assert.isTrue(view.collection.reset.called);
+        assert.isTrue(view.collection.reset.calledWithExactly([]));
       });
 
       it("suggests its loaded", function() {
-        expect(view.loaded).toBe(true);
+        assert.isTrue(view.loaded);
       });
 
       it("changes status text to empty", function() {
-        expect(view.$empty.html()).toBe(view.emptyMessage);
+        assert.equal(view.$empty.html(), view.emptyMessage);
       });
     });
 
@@ -116,21 +139,21 @@ describe("OrderedElementsView", function() {
             id: 'foo'
         });
         group1 = make_group({id: 1, score: 3});
-        view.collection.reset = sinon.spy();
+        view.collection.reset = this.sinon.spy();
         view.reset();
       });
 
       it("calls collection.reset with no value", function() {
-        expect(view.collection.reset.called).toBe(true);
-        expect(view.collection.reset.calledWithExactly()).toBe(true);
+        assert.isTrue(view.collection.reset.called);
+        assert.isTrue(view.collection.reset.calledWithExactly());
       });
 
       it("suggests its not loaded", function() {
-        expect(view.loaded).toBe(false);
+        assert.isFalse(view.loaded);
       });
 
       it("changes status text to loading", function() {
-        expect(view.$empty.html()).toBe(view.loadingMessage);
+        assert.equal(view.$empty.html(), view.loadingMessage);
       });
     });
   });
@@ -140,7 +163,7 @@ describe("OrderedElementsView", function() {
       view = new app.OrderedElementsView({
           id: 'foo'
       });
-      view.addMember = sinon.spy();
+      view.addMember = this.sinon.spy();
     });
 
     it("calls addMember for each item", function() {
@@ -148,9 +171,9 @@ describe("OrderedElementsView", function() {
       group2 = make_group({id: 2, score: 5});
 
       view.extend([group1, group2]);
-      expect(view.addMember.callCount).toBe(2);
-      expect(view.addMember.calledWithExactly(group1)).toBe(true);
-      expect(view.addMember.calledWithExactly(group2)).toBe(true);
+      assert.equal(view.addMember.callCount, 2);
+      assert.isTrue(view.addMember.calledWithExactly(group1));
+      assert.isTrue(view.addMember.calledWithExactly(group2));
     });
   });
 
@@ -165,7 +188,7 @@ describe("OrderedElementsView", function() {
     it("adds to collection", function() {
       group = make_group();
       view.addMember(group);
-      expect(view.collection.models[0].get('id')).toBe(group.id);
+      assert.strictEqual(view.collection.models[0].get('id'), group.id);
     });
 
     it("replaces in collection", function() {
@@ -173,7 +196,7 @@ describe("OrderedElementsView", function() {
       view.addMember(group);
       view.addMember(group);
       view.addMember(group);
-      expect(view.collection.length).toBe(1);
+      assert.strictEqual(view.collection.length, 1);
     });
 
     it("truncated to max items", function(){
@@ -187,15 +210,15 @@ describe("OrderedElementsView", function() {
       view.addMember(group3);
       view.addMember(group4);
 
-      expect(view.collection.length).toBe(3);
+      assert.strictEqual(view.collection.length, 3);
     });
 
     it("sorts members by score after insert", function(){
       view.addMember(make_group({id: 1, score: 3}));
       view.addMember(make_group({id: 2, score: 5}));
 
-      expect(view.collection.models[0].get('id')).toBe(2);
-      expect(view.collection.models[1].get('id')).toBe(1);
+      assert.strictEqual(view.collection.models[0].get('id'), 2);
+      assert.strictEqual(view.collection.models[1].get('id'), 1);
     });
 
     it("doesnt move members that didnt re-rank", function(){
@@ -205,9 +228,9 @@ describe("OrderedElementsView", function() {
       // change the score, but keep it in the same rank
       view.addMember(make_group({id: 2, score: 50}));
 
-      expect(view.collection.models[0].get('id')).toBe(3);
-      expect(view.collection.models[1].get('id')).toBe(2);
-      expect(view.collection.models[2].get('id')).toBe(1);
+      assert.strictEqual(view.collection.models[0].get('id'), 3);
+      assert.strictEqual(view.collection.models[1].get('id'), 2);
+      assert.strictEqual(view.collection.models[2].get('id'), 1);
     });
 
     it("resorts members when they change", function(){
@@ -217,9 +240,9 @@ describe("OrderedElementsView", function() {
       // change the score so it should be at the top
       view.addMember(make_group({id: 1, score: 1000}));
 
-      expect(view.collection.models[0].get('id')).toBe(1);
-      expect(view.collection.models[1].get('id')).toBe(3);
-      expect(view.collection.models[2].get('id')).toBe(2);
+      assert.strictEqual(view.collection.models[0].get('id'), 1);
+      assert.strictEqual(view.collection.models[1].get('id'), 3);
+      assert.strictEqual(view.collection.models[2].get('id'), 2);
     });
 
     it("correctly handles truncating lowest score values", function(){
@@ -230,20 +253,30 @@ describe("OrderedElementsView", function() {
       view.addMember(make_group({id: 5, score: 51}));
       view.addMember(make_group({id: 2, score: 50}));
 
-      expect(view.collection.length).toBe(3);
-      expect(view.collection.models[0].get('id')).toBe(3);
-      expect(view.collection.models[1].get('id')).toBe(4);
-      expect(view.collection.models[2].get('id')).toBe(5);
+      assert.strictEqual(view.collection.length, 3);
+      assert.strictEqual(view.collection.models[0].get('id'), 3);
+      assert.strictEqual(view.collection.models[1].get('id'), 4);
+      assert.strictEqual(view.collection.models[2].get('id'), 5);
     });
 
   });
 
   describe(".renderMemberInContainer", function() {
+    var TestView = Backbone.View.extend({
+      render: function(){
+        var node = $('<li></li>');
+        node.attr('id', 'test-' + this.model.get('id'));
+        this.$el.html(node);
+      }
+    });
+
     beforeEach(function(){
       view = new app.OrderedElementsView({
-          id: 'dummy',
-          maxItems: 3
+          id: 'test-',
+          maxItems: 3,
+          view: TestView
       });
+      view.$parent = $('<ul></ul>');
 
       group1 = make_group({id: 1, score: 3});
       group2 = make_group({id: 2, score: 5});
@@ -255,21 +288,21 @@ describe("OrderedElementsView", function() {
     });
 
     it("pushes highest scored elements to the top on change", function(){
-      group3.set('score', 100);
+      group3.score = 100;
       view.addMember(group3);
       group4 = make_group({id: 4, score: 500});
       view.addMember(group4);
-      expect(view.$parent.find('li').length).toBe(view.collection.models.length);
+      assert.strictEqual(view.$parent.find('li').length, view.collection.length);
     });
 
 
     it("has the correct number of elements", function(){
-      expect(view.$parent.find('li').length).toBe(view.collection.models.length);
+      assert.strictEqual(view.$parent.find('li').length, view.collection.length);
     });
 
     it("has list elements sorted correctly", function(){
       view.$parent.find('li').each(function(_, el){
-        expect(this.id).toBe('dummy' + view.collection.models[_].id);
+        assert.strictEqual(this.id, 'test-' + view.collection.models[_].id);
       });
     });
   });

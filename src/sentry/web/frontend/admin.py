@@ -11,8 +11,7 @@ import pkg_resources
 import sys
 import uuid
 
-from django.contrib.auth.models import User
-from django.conf import settings as dj_settings
+from django.conf import settings
 from django.core.context_processors import csrf
 from django.core.mail import send_mail
 from django.core.urlresolvers import reverse
@@ -23,14 +22,14 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_protect
 
 from sentry.app import env
-from sentry.conf import settings
-from sentry.models import Team, Project, GroupCountByMinute
+from sentry.models import Team, Project, GroupCountByMinute, User
 from sentry.plugins import plugins
 from sentry.utils.http import absolute_uri
-from sentry.web.forms import NewUserForm, ChangeUserForm, RemoveUserForm, TestEmailForm
+from sentry.web.forms import (
+    NewUserForm, ChangeUserForm, RemoveUserForm, TestEmailForm)
 from sentry.web.decorators import requires_admin
-from sentry.web.helpers import (render_to_response, plugin_config,
-    render_to_string)
+from sentry.web.helpers import (
+    render_to_response, plugin_config, render_to_string)
 
 
 def configure_plugin(request, slug):
@@ -72,7 +71,7 @@ def manage_projects(request):
     elif sort == 'events':
         project_list = project_list.annotate(
             events=Sum('projectcountbyminute__times_seen'),
-        ).filter(projectcountbyminute__date__gte=timezone.now() - datetime.timedelta(days=30))
+        ).filter(projectcountbyminute__date__gte=timezone.now() - datetime.timedelta(days=1))
         order_by = '-events'
 
     project_list = project_list.order_by(order_by)
@@ -157,9 +156,11 @@ def create_new_user(request):
             body = render_to_string('sentry/emails/welcome_mail.txt', context, request)
 
             try:
-                send_mail('%s Welcome to Sentry' % (settings.EMAIL_SUBJECT_PREFIX,),
+                send_mail(
+                    '%s Welcome to Sentry' % (settings.EMAIL_SUBJECT_PREFIX,),
                     body, settings.SERVER_EMAIL, [user.email],
-                    fail_silently=False)
+                    fail_silently=False
+                )
             except Exception, e:
                 logger = logging.getLogger('sentry.mail.errors')
                 logger.exception(e)
@@ -286,15 +287,19 @@ def manage_teams(request):
 
 @requires_admin
 def status_env(request):
+    reserved = ('PASSWORD', 'SECRET')
     config = []
     for k in sorted(dir(settings)):
-        if k == 'KEY':
-            continue
+        v_repr = repr(getattr(settings, k))
+        if any(r.lower() in v_repr.lower() for r in reserved):
+            v_repr = '*' * 16
+        if any(r in k for r in reserved):
+            v_repr = '*' * 16
         if k.startswith('_'):
             continue
         if k.upper() != k:
             continue
-        config.append((k, getattr(settings, k)))
+        config.append((k, v_repr))
 
     return render_to_response('sentry/admin/status/env.html', {
         'python_version': sys.version,
@@ -329,19 +334,22 @@ def status_mail(request):
     if form.is_valid():
         body = """This email was sent as a request to test the Sentry outbound email configuration."""
         try:
-            send_mail('%s Test Email' % (settings.EMAIL_SUBJECT_PREFIX,),
+            send_mail(
+                '%s Test Email' % (settings.EMAIL_SUBJECT_PREFIX,),
                 body, settings.SERVER_EMAIL, [request.user.email],
-                fail_silently=False)
+                fail_silently=False
+            )
         except Exception, e:
             form.errors['__all__'] = [unicode(e)]
 
     return render_to_response('sentry/admin/status/mail.html', {
         'form': form,
-        'EMAIL_HOST': dj_settings.EMAIL_HOST,
-        'EMAIL_HOST_PASSWORD': bool(dj_settings.EMAIL_HOST_PASSWORD),
-        'EMAIL_HOST_USER': dj_settings.EMAIL_HOST_USER,
-        'EMAIL_PORT': dj_settings.EMAIL_PORT,
-        'EMAIL_USE_TLS': dj_settings.EMAIL_USE_TLS,
+        'EMAIL_HOST': settings.EMAIL_HOST,
+        'EMAIL_HOST_PASSWORD': bool(settings.EMAIL_HOST_PASSWORD),
+        'EMAIL_HOST_USER': settings.EMAIL_HOST_USER,
+        'EMAIL_PORT': settings.EMAIL_PORT,
+        'EMAIL_USE_TLS': settings.EMAIL_USE_TLS,
+        'SERVER_EMAIL': settings.SERVER_EMAIL,
     }, request)
 
 

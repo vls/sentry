@@ -12,7 +12,6 @@
             {% trans "Regression" %}
         {% endif %}
     </small></h1>
-    <span class="count">{{ group.times_seen }}</span>
 {% endblock %}
 
 {% block inner %}
@@ -41,11 +40,10 @@
         </tr>
     </table>
 
-    {% for label, text in interfaces %}
+    {% for int_id, label, text in interfaces %}
     <div class="interface">
         <div class="title">{{ label }}</div>
-
-        <pre>{{ text }}</pre>
+		{{ text }}
     </div>
     {% endfor %}
 

@@ -11,7 +11,11 @@ These are additional urls used by the Sentry-provided web server
 import os
 
 from sentry.web.urls import urlpatterns as web_urlpatterns
-from django.conf.urls.defaults import patterns, url, include
+try:
+    from django.conf.urls import include, patterns, url
+except ImportError:
+    # django < 1.5 compat
+    from django.conf.urls.defaults import include, patterns, url  # NOQA
 from django.contrib import admin
 from django.views.defaults import page_not_found
 
@@ -38,6 +42,5 @@ def handler500(request):
     return HttpResponseServerError(t.render(Context(context)))
 
 urlpatterns = patterns('',
-    url(r'^i18n/', include('django.conf.urls.i18n')),
     url(r'^admin/', include(admin.site.urls)),
 ) + web_urlpatterns

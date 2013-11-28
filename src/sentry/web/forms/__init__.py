@@ -6,10 +6,10 @@ sentry.web.forms
 :license: BSD, see LICENSE for more details.
 """
 from django import forms
-from django.contrib.auth.models import User
 from django.utils.translation import ugettext_lazy as _
 
 from sentry.interfaces import Http
+from sentry.models import User, Activity
 from sentry.web.forms.fields import RadioFieldRenderer
 
 
@@ -61,3 +61,17 @@ class RemoveUserForm(forms.Form):
 
 class TestEmailForm(forms.Form):
     pass
+
+
+class NewNoteForm(forms.Form):
+    text = forms.CharField(widget=forms.Textarea(attrs={'class': 'span8'}))
+
+    def save(self, event, user):
+        activity = Activity.objects.create(
+            group=event.group, event=event, project=event.project,
+            type=Activity.NOTE, user=user,
+            data=self.cleaned_data
+        )
+        activity.send_notification()
+
+        return activity

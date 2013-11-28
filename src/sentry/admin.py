@@ -1,12 +1,24 @@
 from django.contrib import admin
-from sentry.models import Project, Team
+from django.contrib.auth.admin import UserAdmin
+from django.utils.safestring import mark_safe
+from django.utils.html import escape
+from sentry.models import Project, Team, User
 
 
 class ProjectAdmin(admin.ModelAdmin):
-    list_display = ('name', 'owner', 'slug', 'public', 'date_added', 'status')
-    list_filter = ('public', 'status')
-    search_fields = ('name', 'owner__username', 'owner__email', 'slug')
-    raw_id_fields = ('owner',)
+    list_display = ('full_slug', 'owner', 'platform', 'date_added')
+    list_filter = ('status', 'platform', 'public')
+    search_fields = ('name', 'owner__username', 'owner__email', 'team__slug',
+                     'team__name', 'slug')
+    raw_id_fields = ('owner', 'team')
+
+    def full_slug(self, instance):
+        if not instance.team:
+            slug = instance.slug
+        else:
+            slug = '%s/%s' % (instance.team.slug, instance.slug)
+        return mark_safe('%s<br><small>%s</small>' % (
+            escape(slug), escape(instance.name)))
 
 admin.site.register(Project, ProjectAdmin)
 
@@ -17,3 +29,5 @@ class TeamAdmin(admin.ModelAdmin):
     raw_id_fields = ('owner',)
 
 admin.site.register(Team, TeamAdmin)
+
+admin.site.register(User, UserAdmin)

@@ -17,7 +17,7 @@ client.captureMessage('hello world!')
 # {% trans "capture an exception" %}
 try:
     1 / 0
-except DivisionError:
+except ZeroDivisionError:
     client.captureException()</pre>
 
 	<p>{% trans "If you want to wrap a WSGI app to record uncaught exceptions, Raven provides a middleware for that:" %}</p>
@@ -25,4 +25,9 @@ except DivisionError:
 	<pre>from raven.middleware import Sentry
 
 application = Sentry(application, client=client)</pre>
+
+	<p>{% trans "If you wish to test your connection to the server, you can use the raven test command:" %}</p>
+
+	<pre>raven test {% if dsn %}{{ dsn }}{% else %}<strong>SENTRY_DSN</strong>{% endif %}</pre>
+
 {% endblock %}

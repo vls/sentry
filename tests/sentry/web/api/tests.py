@@ -3,9 +3,8 @@
 from __future__ import absolute_import
 
 import mock
-from django.contrib.auth.models import User
 from django.core.urlresolvers import reverse
-from sentry.models import Team, Project, TeamMember, AccessGroup
+from sentry.models import Team, Project, TeamMember, AccessGroup, User
 from sentry.testutils import TestCase, fixture, before
 from sentry.utils import json
 
@@ -115,7 +114,7 @@ class CrossDomainXmlTest(TestCase):
         self.assertEquals(resp.status_code, 200)
         self.assertEquals(resp['Content-Type'], 'application/xml')
         self.assertTemplateUsed(resp, 'sentry/crossdomain.xml')
-        assert '<allow-http-request-headers-from domain="*" headers="X-Sentry-Auth" secure="false" />' in resp.content
+        assert '<allow-http-request-headers-from domain="*" headers="*" secure="false" />' in resp.content
 
 
 class CrossDomainXmlIndexTest(TestCase):

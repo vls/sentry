@@ -1,6 +1,6 @@
 """
-sentry.web.views
-~~~~~~~~~~~~~~~~
+sentry.web.helpers
+~~~~~~~~~~~~~~~~~~
 
 :copyright: (c) 2010-2013 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
@@ -9,25 +9,25 @@ sentry.web.views
 import logging
 import warnings
 
-from django.conf import settings as dj_settings
+from django.conf import settings
 from django.core.urlresolvers import reverse, resolve
 from django.http import HttpResponse
 from django.template import loader, RequestContext, Context
 from django.utils.datastructures import SortedDict
 from django.utils.safestring import mark_safe
 
-from sentry.conf import settings
-from sentry.constants import MEMBER_OWNER
+from sentry.constants import MEMBER_OWNER, EVENTS_PER_PAGE, STATUS_HIDDEN
 from sentry.models import Project, Team, Option, ProjectOption, ProjectKey
-from sentry.permissions import can_create_projects, can_create_teams
 
 logger = logging.getLogger('sentry.errors')
 
 
 def get_project_list(user=None, access=None, hidden=False, key='id', team=None):
     warnings.warn('get_project_list is Deprecated. Use Project.objects.get_for_user instead.', DeprecationWarning)
-    return SortedDict((getattr(p, key), p)
-            for p in Project.objects.get_for_user(user, access))
+    return SortedDict(
+        (getattr(p, key), p)
+        for p in Project.objects.get_for_user(user, access)
+    )
 
 
 def group_is_public(group, user):
@@ -68,11 +68,11 @@ def get_login_url(reset=False):
         # if LOGIN_URL resolves force login_required to it instead of our own
         # XXX: this must be done as late as possible to avoid idempotent requirements
         try:
-            resolve(dj_settings.LOGIN_URL)
+            resolve(settings.LOGIN_URL)
         except Exception:
-            _LOGIN_URL = settings.LOGIN_URL
+            _LOGIN_URL = settings.SENTRY_LOGIN_URL
         else:
-            _LOGIN_URL = dj_settings.LOGIN_URL
+            _LOGIN_URL = settings.LOGIN_URL
 
         if _LOGIN_URL is None:
             _LOGIN_URL = reverse('sentry-login')
@@ -81,7 +81,7 @@ def get_login_url(reset=False):
 
 def get_internal_project():
     try:
-        project = Project.objects.get(id=settings.PROJECT)
+        project = Project.objects.get(id=settings.SENTRY_PROJECT)
     except Project.DoesNotExist:
         return {}
     try:
@@ -99,30 +99,36 @@ def get_default_context(request, existing_context=None, team=None):
     from sentry.plugins import plugins
 
     context = {
-        'HAS_SEARCH': settings.USE_SEARCH,
-        'MESSAGES_PER_PAGE': settings.MESSAGES_PER_PAGE,
-        'URL_PREFIX': settings.URL_PREFIX,
+        'HAS_SEARCH': settings.SENTRY_USE_SEARCH,
+        'EVENTS_PER_PAGE': EVENTS_PER_PAGE,
+        'URL_PREFIX': settings.SENTRY_URL_PREFIX,
         'PLUGINS': plugins,
+        'STATUS_HIDDEN': STATUS_HIDDEN,
     }
 
     if request:
+        if existing_context and not team and 'team' in existing_context:
+            team = existing_context['team']
+
         context.update({
             'request': request,
-            'can_create_teams': can_create_teams(request.user),
         })
         if team:
+            # TODO: remove this extra query
             context.update({
-                'can_admin_team': Team.objects.get_for_user(request.user, MEMBER_OWNER),
-                'can_create_projects': can_create_projects(request.user, team=team),
+                'can_admin_team': [team in Team.objects.get_for_user(request.user, MEMBER_OWNER)],
             })
-        else:
-            context['can_create_projects'] = can_create_projects(request.user)
+
+        if not existing_context or 'TEAM_LIST' not in existing_context:
+            context['TEAM_LIST'] = Team.objects.get_for_user(
+                request.user, with_projects=True).values()
 
         if not existing_context or 'PROJECT_LIST' not in existing_context:
-            project_list = Project.objects.get_for_user(request.user, team=team)
-            context['PROJECT_LIST'] = sorted(project_list, key=lambda x: x.name)
-        if not existing_context or 'TEAM_LIST' not in existing_context:
-            context['TEAM_LIST'] = sorted(Team.objects.get_for_user(request.user).values(), key=lambda x: x.name)
+            # HACK:
+            for t, p_list in context['TEAM_LIST']:
+                if t == team:
+                    context['PROJECT_LIST'] = p_list
+                    break
 
     return context
 
@@ -132,8 +138,6 @@ def render_to_string(template, context=None, request=None):
     # HACK: set team session value for dashboard redirect
     if context and 'team' in context and isinstance(context['team'], Team):
         team = context['team']
-        if request and request.session.get('team') != team.slug:
-            request.session['team'] = team.slug
     else:
         team = None
 
@@ -204,8 +208,12 @@ def plugin_config(plugin, project, request):
 
     from django.template.loader import render_to_string
     return ('display', mark_safe(render_to_string(template, {
-            'form': form,
-            'request': request,
-            'plugin': plugin,
-            'plugin_description': plugin.get_description() or '',
-        }, context_instance=RequestContext(request))))
+        'form': form,
+        'request': request,
+        'plugin': plugin,
+        'plugin_description': plugin.get_description() or '',
+    }, context_instance=RequestContext(request))))
+
+
+def get_raven_js_url():
+    return settings.SENTRY_RAVEN_JS_URL

@@ -1,6 +1,8 @@
 Writing a Client
 ================
 
+.. note:: This document describes protocol version 4.
+
 A client at its core is simply a set of utilities for capturing various
 logging parameters. Given these parameters, it then builds a JSON payload
 which it will send to a Sentry server using some sort of authentication
@@ -144,7 +146,7 @@ transports are available on top of HTTP:
 Building the JSON Packet
 ------------------------
 
-The body of the post is a string representation of a JSON object. It is also preferably gzipped encoding,
+The body of the post is a string representation of a JSON object. It is also preferably gzip encoded,
 which also means its expected to be base64-encoded.
 
 For example, with an included Exception event, a basic JSON body might resemble the following::
@@ -157,11 +159,11 @@ For example, with an included Exception event, a basic JSON body might resemble 
             "tags": {
                 "ios_version": "4.0"
             },
-            "sentry.interfaces.Exception": {
+            "exception": [{
                 "type": "SyntaxError":
                 "value": "Wattttt!",
                 "module": "__builtins__"
-            }
+            }]
         }
 
 The following attributes are required for all events:
@@ -340,7 +342,7 @@ Authentication
 
 An authentication header is expected to be sent along with the message body, which acts as as an ownership identifier::
 
-    X-Sentry-Auth: Sentry sentry_version=2.0,
+    X-Sentry-Auth: Sentry sentry_version=4,
     sentry_client=<client version, arbitrary>,
     sentry_timestamp=<current timestamp>,
     sentry_key=<public api key>,
@@ -351,19 +353,19 @@ An authentication header is expected to be sent along with the message body, whi
 
 .. data:: sentry_version
 
-    The protocol version. This should be sent as the value '2.0'.
+    The protocol version. This should be sent as the value '4'.
 
 .. data:: sentry_client
 
     An arbitrary string which identifies your client, including its version.
 
-    For example, the Python client might send this as 'raven-python/1.0'
+    The typical pattern for this is '**client_name**/**client_version**'.
 
-    This should be included in your User-Agent header rather than here if you're using the HTTP protocol.
+    For example, the Python client might send this as 'raven-python/1.0'.
 
 .. data:: sentry_timestamp
 
-    The unix timestamp representing the time at which this POST request was generated.
+    The unix timestamp representing the time at which this event was generated.
 
 .. data:: sentry_key
 
@@ -373,8 +375,9 @@ An authentication header is expected to be sent along with the message body, whi
 
     The secret key which should be provided as part of the client configuration.
 
-    .. note:: You should only pass the secret key if you're communicating via the server. Client-side behavior (such
-              as JavaScript) should use CORS.
+    .. note:: You should only pass the secret key if you're communicating via
+              secure communication to the server. Client-side behavior (such
+              as JavaScript) should use CORS, and only pass the public key.
 
 crossdomain.xml
 ~~~~~~~~~~~~~~~
@@ -396,7 +399,7 @@ The request body should then somewhat resemble the following::
 
     POST /api/project-id/store/
     User-Agent: raven-python/1.0
-    X-Sentry-Auth: Sentry sentry_version=3, sentry_timestamp=1329096377,
+    X-Sentry-Auth: Sentry sentry_version=4, sentry_timestamp=1329096377,
         sentry_key=b70a31b3510c4cf793964a185cfe1fd0, sentry_client=raven-python/1.0,
         sentry_secret=b7d80b520139450f903720eb7991bf3d
 
@@ -406,12 +409,49 @@ The request body should then somewhat resemble the following::
         "culprit": "my.module.function_name",
         "timestamp": "2011-05-02T17:41:36",
         "message": "SyntaxError: Wattttt!",
-        "sentry.interfaces.Exception": {
+        "exception": [{
             "type": "SyntaxError",
             "value": "Wattttt!",
             "module": "__builtins__"
-        }
+        }]
     }
+
+Reading the Response
+--------------------
+
+If you're using HTTP, you'll receive a response from the server. The response
+looks something like this:
+
+::
+
+    HTTP/1.1 200 OK
+    Content-Type: application/json
+
+    {
+        "id": "fc6d8c0c43fc4630ad850ee518f1b9d0"
+    }
+
+One thing to take note of is the response status code. Sentry uses this in a
+variety of ways. You'll **always** want to check for a 200 response if you want
+to ensure that the message was delivered, as a small level of validation
+happens immediately that may result in a different response code (and message).
+
+For example, you might get something like this:
+
+::
+
+
+    HTTP/1.1 400 Bad Request
+    X-Sentry-Error: Client request error: Missing client version identifier
+
+    Client request error: Missing client version identifier
+
+
+.. note:: The X-Sentry-Error header will always be present with the precise
+          error message and it is the preferred way to identify the root cause.
+
+          If it's not available, it's likely the request was not handled by the
+          API server, or a critical system failure has occurred.
 
 Handling Failures
 -----------------
@@ -423,7 +463,7 @@ care of several key things:
 * Exponential backoff when Sentry fails (don't continue trying if the server is offline)
 * Failover to a standard logging module on errors.
 
-For example, the Python client will log any failed requests to the Sentry server to a named logger, ``sentry.errors``. 
+For example, the Python client will log any failed requests to the Sentry server to a named logger, ``sentry.errors``.
 It will also only retry every few seconds, based on how many consecutive failures its seen. The code for this is simple::
 
     def should_try(self):
@@ -508,3 +548,22 @@ If your platform supports it, block level context should also be available::
 
     with client.context({'tags': {'foo': 'bar'}}):
         # ...
+
+Variable Size
+-------------
+
+Most arbitrary values in Sentry have their size restricted. This means any
+values that are sent as metadata (such as variables in a stacktrace) as well
+as things like extra data, or tags.
+
+- Mappings of values (such as HTTP data, extra data, etc) are limited to 50
+  item pairs.
+- Event IDs are limited to 32 characters.
+- Tag keys are limited to 32 characters.
+- Tag values are limited to 200 characters.
+- Culprits are limited to 200 characters.
+- Most contextual variables are limited to 512 characters.
+- Extra contextual data is limited to 2048 characters.
+- Messages are limited to 1024 * 10 characters.
+- Http data (the body) is limited to 2048 characters.
+- Stacktrace's are limited to 50 frames. If more are sent, data will be removed from the middle of the stack.

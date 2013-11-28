@@ -6,13 +6,14 @@ import datetime
 import mock
 import pytest
 
-from django.contrib.auth.models import User
 from django.utils import timezone
 from sentry.constants import MEMBER_OWNER, MEMBER_USER
 from sentry.interfaces import Interface
 from sentry.manager import get_checksum_from_event
-from sentry.models import Event, Group, Project, GroupCountByMinute, ProjectCountByMinute, \
-  SearchDocument, Team
+from sentry.models import (
+    Event, Group, Project, GroupCountByMinute, ProjectCountByMinute,
+    Team, EventMapping, User, AccessGroup
+)
 from sentry.utils.db import has_trending  # NOQA
 from sentry.testutils import TestCase
 
@@ -23,14 +24,6 @@ class DummyInterface(Interface):
 
 
 class SentryManagerTest(TestCase):
-    @mock.patch('sentry.models.SearchDocument.objects.index')
-    def test_broken_search_index(self, index):
-        index.side_effect = Exception()
-
-        event = Group.objects.from_kwargs(1, message='foo')
-        self.assertEquals(event.message, 'foo')
-        self.assertEquals(event.project_id, 1)
-
     @mock.patch('sentry.signals.regression_signal.send')
     def test_broken_regression_signal(self, send):
         send.side_effect = Exception()
@@ -38,6 +31,17 @@ class SentryManagerTest(TestCase):
         event = Group.objects.from_kwargs(1, message='foo')
         self.assertEquals(event.message, 'foo')
         self.assertEquals(event.project_id, 1)
+
+    @mock.patch.object(Group.objects, 'should_sample')
+    def test_saves_event_mapping_when_sampled(self, should_sample):
+        should_sample.return_value = True
+        event_id = 'a' * 32
+
+        event = Group.objects.from_kwargs(1, message='foo', event_id=event_id)
+        group = event.group
+
+        assert EventMapping.objects.filter(
+            group=group, event_id=event_id).exists()
 
     def test_invalid_project(self):
         self.assertRaises(Project.DoesNotExist, Group.objects.from_kwargs, 2, message='foo')
@@ -47,32 +51,6 @@ class SentryManagerTest(TestCase):
         self.assertEquals(event.group.last_seen, event.datetime)
         self.assertEquals(event.message, 'foo')
         self.assertEquals(event.project_id, 1)
-
-    def test_records_users_seen(self):
-        # TODO: we could lower the level of this test by just testing our signal receiver's logic
-        event = Group.objects.from_kwargs(1, message='foo', **{
-            'sentry.interfaces.User': {
-                'email': 'foo@example.com',
-            },
-        })
-        group = Group.objects.get(id=event.group_id)
-        assert group.users_seen == 1
-
-        event = Group.objects.from_kwargs(1, message='foo', **{
-            'sentry.interfaces.User': {
-                'email': 'foo@example.com',
-            },
-        })
-        group = Group.objects.get(id=event.group_id)
-        assert group.users_seen == 1
-
-        event = Group.objects.from_kwargs(1, message='foo', **{
-            'sentry.interfaces.User': {
-                'email': 'bar@example.com',
-            },
-        })
-        group = Group.objects.get(id=event.group_id)
-        assert group.users_seen == 2
 
     def test_valid_timestamp_without_tz(self):
         # TODO: this doesnt error, but it will throw a warning. What should we do?
@@ -160,14 +138,14 @@ class SentryManagerTest(TestCase):
     def test_tags_as_list(self, add_tags):
         event = Group.objects.from_kwargs(1, message='foo', tags=[('foo', 'bar')])
         group = event.group
-        add_tags.assert_called_once_with(group, [('foo', 'bar'), ('logger', 'root'), ('level', 'error')])
+        add_tags.assert_called_once_with(group, [('foo', 'bar'), ('level', 'error'), ('logger', 'root')])
 
     @mock.patch('sentry.manager.send_group_processors', mock.Mock())
     @mock.patch('sentry.manager.GroupManager.add_tags')
     def test_tags_as_dict(self, add_tags):
         event = Group.objects.from_kwargs(1, message='foo', tags={'foo': 'bar'})
         group = event.group
-        add_tags.assert_called_once_with(group, [('foo', 'bar'), ('logger', 'root'), ('level', 'error')])
+        add_tags.assert_called_once_with(group, [('foo', 'bar'), ('level', 'error'), ('logger', 'root')])
 
     @mock.patch('sentry.manager.send_group_processors', mock.Mock())
     def test_platform_is_saved(self):
@@ -218,14 +196,6 @@ class SentryManagerTest(TestCase):
         self.assertEquals(group.last_seen.replace(microsecond=0), event.datetime.replace(microsecond=0))
         self.assertEquals(group.message, 'foo bar')
 
-    @mock.patch('sentry.manager.maybe_delay')
-    def test_scrapes_javascript_source(self, maybe_delay):
-        from sentry.tasks.fetch_source import fetch_javascript_source
-        with self.Settings(SENTRY_SCRAPE_JAVASCRIPT_CONTEXT=True):
-            event = Group.objects.from_kwargs(1, message='hello', platform='javascript')
-
-            maybe_delay.assert_any_call(fetch_javascript_source, event, expires=900)
-
     def test_add_tags(self):
         event = Group.objects.from_kwargs(1, message='rrr')
         group = event.group
@@ -245,29 +215,6 @@ class SentryManagerTest(TestCase):
         res = results[0]
         self.assertEquals(res.value, 'boz')
         self.assertEquals(res.times_seen, 1)
-
-
-class SearchManagerTest(TestCase):
-    def test_search(self):
-        project = Project.objects.all()[0]
-        group = Group.objects.create(project=project, message='foo', checksum='a' * 32)
-        doc = SearchDocument.objects.create(
-            project=project,
-            group=group,
-            status=group.status,
-            total_events=1,
-            date_added=group.first_seen,
-            date_changed=group.last_seen,
-        )
-        doc.token_set.create(
-            field='text',
-            token='foo',
-        )
-
-        results = list(SearchDocument.objects.search(project, query='foo'))
-        self.assertEquals(len(results), 1)
-        # This uses a raw query set so we have to check the id
-        self.assertEquals(results[0].id, doc.id)
 
 
 @pytest.mark.skipif('not has_trending()')
@@ -334,41 +281,32 @@ class ProjectManagerTest(TestCase):
         self.user.is_superuser = False
         get_for_user.return_value = {self.project2.team.id: self.project2.team}
         project_list = Project.objects.get_for_user(self.user)
-        get_for_user.assert_called_once_with(self.user, None)
+        get_for_user.assert_called_once_with(self.user, None, access_groups=False)
         assert project_list == [self.project2]
 
         get_for_user.reset_mock()
         project_list = Project.objects.get_for_user(self.user, MEMBER_USER)
-        get_for_user.assert_called_once_with(self.user, MEMBER_USER)
+        get_for_user.assert_called_once_with(self.user, MEMBER_USER, access_groups=False)
         assert project_list == [self.project2]
 
 
 class TeamManagerTest(TestCase):
-    def test_public_install_returns_all_teams_without_access(self):
-        teams = {self.team.slug: self.team}
-        user = User.objects.create()
-
-        with self.Settings(SENTRY_PUBLIC=True):
-            result = Team.objects.get_for_user(user)
-
-        assert result == teams
-
-    def test_public_install_returns_accessible_teams_with_access(self):
-        user = User.objects.create()
+    def test_simple(self):
+        user = User.objects.create(username='foo')
+        user2 = User.objects.create(username='bar')
+        user3 = User.objects.create(username='baz')
         team = Team.objects.create(name='Test', owner=user)
-        teams = {team.slug: team}
+        group = AccessGroup.objects.create(name='Test', type=MEMBER_USER, team=team)
+        group.members.add(user2)
 
-        with self.Settings(SENTRY_PUBLIC=True):
-            result = Team.objects.get_for_user(user, access=MEMBER_OWNER)
+        result = Team.objects.get_for_user(user, access=MEMBER_OWNER)
+        assert result == {team.slug: team}
 
-        assert result == teams
+        result = Team.objects.get_for_user(user2, access=MEMBER_OWNER)
+        assert result == {}
 
-    def test_private_install_returns_accessible_teams(self):
-        user = User.objects.create()
-        team = Team.objects.create(name='Test', owner=user)
-        teams = {team.slug: team}
+        result = Team.objects.get_for_user(user2, access=MEMBER_USER)
+        assert result == {team.slug: team}
 
-        with self.Settings(SENTRY_PUBLIC=False):
-            result = Team.objects.get_for_user(user, access=MEMBER_OWNER)
-
-        assert result == teams
+        result = Team.objects.get_for_user(user3, access=MEMBER_OWNER)
+        assert result == {}

@@ -19,9 +19,10 @@ class CommandError(Exception):
 
 
 def handle_sentry(data, address):
-    from sentry.coreapi import project_from_auth_vars, decode_and_decompress_data, \
-        safely_load_json_string, validate_data, insert_data_to_database, APIError, \
-        APIForbidden
+    from sentry.coreapi import (project_from_auth_vars, decode_and_decompress_data,
+        safely_load_json_string, validate_data, insert_data_to_database, APIError,
+        APIForbidden)
+    from sentry.models import Group
     from sentry.exceptions import InvalidData
     from sentry.plugins import plugins
     from sentry.utils.auth import parse_auth_header
@@ -54,6 +55,8 @@ def handle_sentry(data, address):
         except InvalidData, e:
             raise APIError(u'Invalid data: %s (%s)' % (unicode(e), type(e)))
 
+        Group.objects.normalize_event_data(data)
+
         return insert_data_to_database(data)
     except APIError, error:
         logger.exception('bad message from %s' % (address,))
@@ -70,10 +73,10 @@ class BaseUDPServer(Service):
 
     def __init__(self, host=None, port=None, debug=False, workers=None):
         super(BaseUDPServer, self).__init__(debug=debug)
-        from sentry.conf import settings
+        from django.conf import settings
 
-        self.host = host or settings.UDP_HOST
-        self.port = port or settings.UDP_PORT
+        self.host = host or settings.SENTRY_UDP_HOST
+        self.port = port or settings.SENTRY_UDP_PORT
         self.workers = workers or self.POOL_SIZE
 
     def setup(self):
@@ -90,9 +93,15 @@ class BaseUDPServer(Service):
             raise CommandError(
                 'It seems that you don\'t have the ``%s`` package installed, '
                 'which is required to run the udp service.' % (self.name,))
-        sock = self._socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
+        try:
+            sock = self._socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((self.host.strip('[]'), self.port))
+        except (socket.gaierror, socket.error):
+            sock = self._socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((self.host, self.port))
         while True:
             try:
                 self._spawn(self.handle, *sock.recvfrom(self.BUF_SIZE))
@@ -130,11 +139,11 @@ default_servers = {
 
 
 def get_server_class(worker=None):
-    from sentry.conf import settings
+    from django.conf import settings
 
     if worker is None:
         # Use eventlet as default worker type
-        worker = getattr(settings, 'UDP_WORKER', None) or 'eventlet'
+        worker = getattr(settings, 'SENTRY_UDP_WORKER', None) or 'eventlet'
     if worker not in default_servers:
         raise CommandError(
             'Unsupported udp server type; expected one of %s, but got "%s".'

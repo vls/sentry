@@ -15,6 +15,7 @@ from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect, HttpResponse
 
 from sentry.utils.managers import InstanceManager
+from sentry.utils.safe import safe_execute
 from threading import local
 
 
@@ -55,9 +56,7 @@ class PluginManager(InstanceManager):
 
     def for_project(self, project):
         for plugin in self.all():
-            if not plugin.is_enabled(project):
-                continue
-            if not plugin.has_project_conf():
+            if not safe_execute(plugin.is_enabled, project):
                 continue
             yield plugin
 
@@ -71,7 +70,7 @@ class PluginManager(InstanceManager):
         for plugin in self.all():
             if plugin.slug == slug:
                 return plugin
-        raise KeyError
+        raise KeyError(slug)
 
     def first(self, func_name, *args, **kwargs):
         for plugin in self.all():
@@ -121,7 +120,7 @@ class IPlugin(local):
     control when or how the plugin gets instantiated, nor is it guaranteed that
     it will happen, or happen more than once.
 
-    >>> from sentry.plugins import Plugin
+    >>> from sentry.plugins import Plugin  # NOQA
     >>> class MyPlugin(Plugin):
     >>>     title = 'My Plugin'
     >>>
@@ -151,6 +150,7 @@ class IPlugin(local):
 
     # Global enabled state
     enabled = True
+    can_disable = True
 
     # Should this plugin be enabled by default for projects?
     project_default_enabled = False
@@ -168,6 +168,8 @@ class IPlugin(local):
         """
         if not self.enabled:
             return False
+        if not self.can_disable:
+            return True
         if not self.can_enable_for_projects():
             return True
 
@@ -327,7 +329,7 @@ class IPlugin(local):
             return response
 
         if not isinstance(response, Response):
-            raise NotImplementedError('Please use self.render() when returning responses.')
+            raise NotImplementedError('Use self.render() when returning responses.')
 
         event = group.get_latest_event() or Event()
         event.group = group
@@ -424,6 +426,13 @@ class IPlugin(local):
 
     # Server side signals which do not have request context
 
+    def is_rate_limited(self, project, **kwargs):
+        """
+        Return True if this project (or the system) is over any defined
+        quotas.
+        """
+        return False
+
     def has_perm(self, user, perm, *objects, **kwargs):
         """
         Given a user, a permission name, and an optional list of objects
@@ -433,7 +442,7 @@ class IPlugin(local):
         :param perm: a string, such as "edit_project"
         :param objects: an optional list of objects
 
-        If your plugin does not modify this permission, simply return None.
+        If your plugin does not modify this permission, simply return ``None``.
 
         For example, has perm might be called like so:
 
@@ -449,17 +458,52 @@ class IPlugin(local):
         """
         return None
 
+    def missing_perm_response(self, request, perm, *args, **objects):
+        """
+        Given a user, a permission name, and an optional mapping of objects
+        within a context, returns a custom response.
+
+        :param user: either an instance of ``AnonymousUser`` or ``User``.
+        :param perm: a string, such as "edit_project"
+        :param objects: an optional mapping of objects
+
+        If your plugin does not need to override this response, simply return
+        ``None``.
+        """
+
+    def on_alert(self, alert, **kwargs):
+        """
+        Called when a new alert is generated.
+
+        :param alert: an instance of ``Alert``
+
+        >>> def on_alert(self, alert, **kwargs):
+        >>>     print 'New alert!', alert.message
+        >>>     print alert.get_absolute_url()
+        """
+
     def post_process(self, group, event, is_new, is_sample, **kwargs):
         """
         Post processes an event after it has been saved.
 
         :param group: an instance of ``Group``
         :param event: an instance of ``Event``
-        :param is_new: a boolean describing if this event is new, or has changed state
+        :param is_new: a boolean describing if this group is new, or has changed state
         :param is_sample: a boolean describing if this event was stored, or sampled
 
         >>> def post_process(self, event, **kwargs):
         >>>     print 'New event created:', event.id
+        >>>     print group.get_absolute_url()
+        """
+
+    def get_tags(self, event, **kwargs):
+        """
+        Return additional tags to add to this instance.
+
+        Tags should be a list of tuples.
+
+        >>> def get_tags(self, event, **kwargs):
+        >>>     return [('tag-name', 'tag-value')]
         """
 
     def get_filters(self, project=None, **kwargs):

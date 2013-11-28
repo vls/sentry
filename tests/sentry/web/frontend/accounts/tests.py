@@ -4,10 +4,9 @@ from __future__ import absolute_import
 
 import mock
 
-from django.contrib.auth.models import User
 from django.core.urlresolvers import reverse
 from django.http import HttpRequest
-from sentry.models import UserOption, LostPasswordHash
+from sentry.models import UserOption, LostPasswordHash, User
 from sentry.testutils import TestCase, fixture, before
 from sentry.web.frontend.accounts import login_redirect
 from social_auth.models import UserSocialAuth
@@ -33,8 +32,8 @@ class LoginTest(TestCase):
             'password': 'bizbar',
         })
         assert resp.status_code == 200
-        assert (resp.context['form'].errors['__all__'] ==
-            [u'Please enter a correct username and password. Note that both fields are case-sensitive.'])
+        assert resp.context['form'].errors['__all__'] == \
+            [u'Please enter a correct username and password. Note that both fields may be case-sensitive.']
 
     def test_valid_credentials(self):
         # load it once for test cookie
@@ -66,13 +65,12 @@ class RegisterTest(TestCase):
     def test_with_required_params(self):
         with self.Settings(SENTRY_ALLOW_REGISTRATION=True):
             resp = self.client.post(self.path, {
-                'username': 'test',
-                'email': 'test@example.com',
+                'username': 'test-a-really-long-email-address@example.com',
                 'password': 'foobar',
             })
             assert resp.status_code == 302
-            user = User.objects.get(username='test')
-            assert user.email == 'test@example.com'
+            user = User.objects.get(username='test-a-really-long-email-address@example.com')
+            assert user.email == 'test-a-really-long-email-address@example.com'
             assert user.check_password('foobar')
 
 

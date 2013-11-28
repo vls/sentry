@@ -4,8 +4,8 @@ from django.http import HttpResponseRedirect, HttpResponse
 from django.shortcuts import get_object_or_404
 
 from sentry.models import Project, Team, Group
-from sentry.web.helpers import render_to_response, \
-  get_login_url
+from sentry.web.helpers import (
+    render_to_response, get_login_url)
 
 
 def has_access(access_or_func=None, team=None, access=None):
@@ -62,15 +62,14 @@ def has_access(access_or_func=None, team=None, access=None):
 
             if project_id:
                 # Support project id's
-                if project_id.isdigit():
-                    lookup_kwargs = {'id': int(project_id)}
-                else:
-                    lookup_kwargs = {'slug': project_id}
-
-                if team:
-                    lookup_kwargs['team'] = team
-
                 if request.user.is_superuser:
+                    if project_id.isdigit():
+                        lookup_kwargs = {'id': int(project_id)}
+                    elif team:
+                        lookup_kwargs = {'slug': project_id, 'team': team}
+                    else:
+                        return HttpResponseRedirect(reverse('sentry'))
+
                     try:
                         project = Project.objects.get_from_cache(**lookup_kwargs)
                     except Project.DoesNotExist:
@@ -83,8 +82,16 @@ def has_access(access_or_func=None, team=None, access=None):
                         else:
                             return HttpResponseRedirect(reverse('sentry'))
                 else:
-                    key, value = lookup_kwargs.items()[0]
                     project_list = Project.objects.get_for_user(request.user, access, team=team)
+
+                    if project_id.isdigit():
+                        key = 'id'
+                        value = int(project_id)
+                    elif team:
+                        key = 'slug'
+                        value = project_id
+                    else:
+                        return HttpResponseRedirect(reverse('sentry'))
 
                     for p in project_list:
                         if getattr(p, key) == value:
@@ -112,33 +119,40 @@ def has_access(access_or_func=None, team=None, access=None):
     return wrapped
 
 
-def has_group_access(func):
+def has_group_access(func=None, **kwargs):
     """
     Tests and transforms project_id and group_id for permissions based on
     the requesting user. Passes the actual project and group instances to
     the decorated view.
 
-    >>> @has_group_access
+    >>> @has_group_access(allow_public=True)
     >>> def foo(request, project, group):
     >>>     return
     """
-    prv_func = login_required(has_access(func))
+    if func:
+        return has_group_access(**kwargs)(func)
 
-    @wraps(func)
-    def wrapped(request, team_slug, project_id, group_id, *args, **kwargs):
-        group = get_object_or_404(Group, pk=group_id)
+    allow_public = kwargs.get('allow_public')
 
-        if project_id not in (group.project.slug, str(group.project.id)):
-            return HttpResponse(status=404)
-        if team_slug != group.team.slug:
-            return HttpResponse(status=404)
+    def decorator(func):
+        prv_func = login_required(has_access(func))
 
-        if group.is_public or group.project.public:
-            team = Team.objects.get_from_cache(slug=team_slug)
-            return func(request, team=team, project=group.project, group=group, *args, **kwargs)
+        @wraps(func)
+        def wrapped(request, team_slug, project_id, group_id, *args, **kwargs):
+            group = get_object_or_404(Group, pk=group_id)
 
-        return prv_func(request, team_slug=team_slug, project_id=project_id, group=group, *args, **kwargs)
-    return wrapped
+            if project_id not in (group.project.slug, str(group.project.id)):
+                return HttpResponse(status=404)
+            if team_slug != group.team.slug:
+                return HttpResponse(status=404)
+
+            if allow_public and (group.is_public or group.project.public):
+                team = Team.objects.get_from_cache(slug=team_slug)
+                return func(request, team=team, project=group.project, group=group, *args, **kwargs)
+
+            return prv_func(request, team_slug=team_slug, project_id=project_id, group=group, *args, **kwargs)
+        return wrapped
+    return decorator
 
 
 def login_required(func):

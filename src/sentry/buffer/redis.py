@@ -5,24 +5,14 @@ sentry.buffer.redis
 :copyright: (c) 2010-2013 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
+from __future__ import absolute_import
 
-from __future__ import with_statement
-
-from django.core.exceptions import ImproperlyConfigured
-
-for package in ('nydus', 'redis'):
-    try:
-        __import__(package, {}, {}, [], -1)
-    except ImportError:
-        raise ImproperlyConfigured('Missing %r package, which is required for Redis buffers' %
-            (package,))
-
+from django.conf import settings
 from django.db import models
 from django.utils.encoding import smart_str
 from hashlib import md5
 from nydus.db import create_cluster
 from sentry.buffer import Buffer
-from sentry.conf import settings
 from sentry.utils.compat import pickle
 
 
@@ -32,7 +22,7 @@ class RedisBuffer(Buffer):
     def __init__(self, **options):
         if not options:
             # inherit default options from REDIS_OPTIONS
-            options = settings.REDIS_OPTIONS
+            options = settings.SENTRY_REDIS_OPTIONS
 
         super(RedisBuffer, self).__init__(**options)
         options.setdefault('hosts', {
@@ -68,6 +58,13 @@ class RedisBuffer(Buffer):
                 for k, v in sorted(filters.iteritems())))).hexdigest(),
         )
 
+    def _make_lock_key(self, model, filters):
+        return '%s:lock:%s' % (
+            model._meta,
+            md5(smart_str('&'.join('%s=%s' % (k, self._coerce_val(v))
+                for k, v in sorted(filters.iteritems())))).hexdigest(),
+        )
+
     def incr(self, model, columns, filters, extra=None):
         with self.conn.map() as conn:
             for column, amount in columns.iteritems():
@@ -84,6 +81,13 @@ class RedisBuffer(Buffer):
         super(RedisBuffer, self).incr(model, columns, filters, extra)
 
     def process(self, model, columns, filters, extra=None):
+        lock_key = self._make_lock_key(model, filters)
+        # prevent a stampede due to the way we use celery etas + duplicate
+        # tasks
+        if not self.conn.setnx(lock_key, '1'):
+            return
+        self.conn.expire(lock_key, self.delay)
+
         results = {}
         with self.conn.map() as conn:
             for column, amount in columns.iteritems():

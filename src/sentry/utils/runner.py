@@ -11,10 +11,15 @@ from logan.runner import run_app, configure_app
 import base64
 import os
 import pkg_resources
+import warnings
 
 KEY_LENGTH = 40
 
 CONFIG_TEMPLATE = """
+# This file is just Python, with a touch of Django which means you
+# you can inherit and tweak settings to your hearts content.
+from sentry.conf.server import *
+
 import os.path
 
 CONF_ROOT = os.path.dirname(__file__)
@@ -34,11 +39,21 @@ DATABASES = {
         'PASSWORD': '',
         'HOST': '',
         'PORT': '',
+
+        # If you're using Postgres, we recommend turning on autocommit
+        # 'OPTIONS': {
+        #     'autocommit': True,
+        # }
     }
 }
 
-# If you're expecting any kind of real traffic on Sentry, we highly recommend configuring
-# the CACHES and Redis settings
+
+# If you're expecting any kind of real traffic on Sentry, we highly recommend
+# configuring the CACHES and Redis settings
+
+###########
+## CACHE ##
+###########
 
 # You'll need to install the required dependencies for Memcached:
 #   pip install python-memcached
@@ -50,14 +65,26 @@ DATABASES = {
 #     }
 # }
 
-# Buffers (combined with queueing) act as an intermediate layer between the database and
-# the storage API. They will greatly improve efficiency on large numbers of the same events
-# being sent to the API in a short amount of time.
+###########
+## Queue ##
+###########
 
-# SENTRY_USE_QUEUE = True
-# For more information on queue options, see the documentation for Celery:
-# http://celery.readthedocs.org/en/latest/
+# See http://sentry.readthedocs.org/en/latest/queue/index.html for more
+# information on configuring your queue broker and workers. Sentry relies
+# on a Python framework called Celery to manage queues.
+
+# You can enable queueing of jobs by turning off the always eager setting:
+# CELERY_ALWAYS_EAGER = False
 # BROKER_URL = 'redis://localhost:6379'
+
+####################
+## Update Buffers ##
+####################
+
+# Buffers (combined with queueing) act as an intermediate layer between the
+# database and the storage API. They will greatly improve efficiency on large
+# numbers of the same events being sent to the API in a short amount of time.
+# (read: if you send any kind of real data to Sentry, you should enable buffers)
 
 # You'll need to install the required dependencies for Redis buffers:
 #   pip install redis hiredis nydus
@@ -72,20 +99,29 @@ DATABASES = {
 #     }
 # }
 
-SENTRY_KEY = %(default_key)r
+################
+## Web Server ##
+################
 
-# You should configure the absolute URI to Sentry. It will attempt to guess it if you don't
-# but proxies may interfere with this.
-# SENTRY_URL_PREFIX = 'http://sentry.example.com'  # No trailing slash!
+# You MUST configure the absolute URI root for Sentry:
+SENTRY_URL_PREFIX = 'http://sentry.example.com'  # No trailing slash!
+
+# If you're using a reverse proxy, you should enable the X-Forwarded-Proto
+# and X-Forwarded-Host headers, and uncomment the following settings
+# SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+# USE_X_FORWARDED_HOST = True
 
 SENTRY_WEB_HOST = '0.0.0.0'
 SENTRY_WEB_PORT = 9000
 SENTRY_WEB_OPTIONS = {
     'workers': 3,  # the number of gunicorn workers
+    'limit_request_line': 0,  # required for raven-js
     'secure_scheme_headers': {'X-FORWARDED-PROTO': 'https'},
 }
 
-# Mail server configuration
+#################
+## Mail Server ##
+#################
 
 # For more information check Django's documentation:
 #  https://docs.djangoproject.com/en/1.3/topics/email/?from=olddocs#e-mail-backends
@@ -97,6 +133,17 @@ EMAIL_HOST_PASSWORD = ''
 EMAIL_HOST_USER = ''
 EMAIL_PORT = 25
 EMAIL_USE_TLS = False
+
+# The email address to send on behalf of
+SERVER_EMAIL = 'root@localhost'
+
+###########
+## etc. ##
+###########
+
+# If this file ever becomes compromised, it's important to regenerate your SECRET_KEY
+# Changing this value will result in all current sessions being invalidated
+SECRET_KEY = %(default_key)r
 
 # http://twitter.com/apps/new
 # It's important that input a callback URL, even if its useless. We have no idea why, consult Twitter.
@@ -118,6 +165,10 @@ GITHUB_API_SECRET = ''
 # https://trello.com/1/appKey/generate
 TRELLO_API_KEY = ''
 TRELLO_API_SECRET = ''
+
+# https://confluence.atlassian.com/display/BITBUCKET/OAuth+Consumers
+BITBUCKET_CONSUMER_KEY = ''
+BITBUCKET_CONSUMER_SECRET = ''
 """
 
 
@@ -174,6 +225,56 @@ def initialize_app(config):
     env.data['start_date'] = timezone.now()
 
     install_plugins(config['settings'])
+
+    skip_migration_if_applied(
+        config['settings'], 'kombu.contrib.django', 'djkombu_queue')
+    skip_migration_if_applied(
+        config['settings'], 'social_auth', 'social_auth_association')
+
+    apply_legacy_settings(config)
+
+
+def apply_legacy_settings(config):
+    settings = config['settings']
+
+    # SENTRY_USE_QUEUE used to determine if Celery was eager or not
+    if hasattr(settings, 'SENTRY_USE_QUEUE'):
+        warnings.warn('SENTRY_USE_QUEUE is deprecated. Please use CELERY_ALWAYS_EAGER instead. '
+                      'See http://sentry.readthedocs.org/en/latest/queue/index.html for more information.')
+        settings.CELERY_ALWAYS_EAGER = (not settings.SENTRY_USE_QUEUE)
+
+    # Set ALLOWED_HOSTS if it's not already available
+    if not settings.ALLOWED_HOSTS and settings.SENTRY_URL_PREFIX:
+        from urlparse import urlparse
+        urlbits = urlparse(settings.SENTRY_URL_PREFIX)
+        if urlbits.hostname:
+            settings.ALLOWED_HOSTS = (urlbits.hostname,)
+
+    if not settings.SERVER_EMAIL and hasattr(settings, 'SENTRY_SERVER_EMAIL'):
+        warnings.warn('SENTRY_SERVER_URL is deprecated. Please use SERVER_URL instead.')
+        settings.SERVER_EMAIL = settings.SENTRY_SERVER_EMAIL
+
+
+def skip_migration_if_applied(settings, app_name, table_name,
+                              name='0001_initial'):
+    from south.migration import Migrations
+    from sentry.utils.db import table_exists
+    import types
+
+    migration = Migrations(app_name)[name]
+
+    def skip_if_table_exists(original):
+        def wrapped(self):
+            # TODO: look into why we're having to return some ridiculous
+            # lambda
+            if table_exists(table_name):
+                return lambda x=None: None
+            return original()
+        wrapped.__name__ = original.__name__
+        return wrapped
+
+    migration.forwards = types.MethodType(
+        skip_if_table_exists(migration.forwards), migration)
 
 
 def configure():

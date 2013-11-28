@@ -14,7 +14,7 @@
         },
 
         initialize: function(data){
-            _.bindAll(this);
+            Backbone.View.prototype.initialize.apply(this, arguments);
 
             if (_.isUndefined(data))
                 data = {};
@@ -84,7 +84,7 @@
     app.StreamPage = BasePage.extend({
 
         initialize: function(data){
-            BasePage.prototype.initialize.call(this, data);
+            BasePage.prototype.initialize.apply(this, arguments);
 
             this.group_list = new app.GroupListView({
                 className: 'group-list',
@@ -126,7 +126,7 @@
                         allowClear: true,
                         minimumInputLength: 3,
                         ajax: {
-                            url: this.getSearchTagsUrl(),
+                            url: app.utils.getSearchTagsUrl(),
                             dataType: 'json',
                             data: function (term, page) {
                                 return {
@@ -175,10 +175,6 @@
                 this.control.removeClass('realtime-play');
                 this.control.html(this.control.attr('data-play-label'));
             }
-        },
-
-        getSearchTagsUrl: function(){
-            return app.config.urlPrefix + '/api/' + app.config.teamId + '/' + app.config.projectId + '/tags/search/';
         }
 
     });
@@ -186,7 +182,7 @@
     app.DashboardPage = BasePage.extend({
 
         initialize: function(data){
-            BasePage.prototype.initialize.call(this, data);
+            BasePage.prototype.initialize.apply(this, arguments);
 
             $('#chart').height('150px');
             Sentry.charts.render('#chart');
@@ -194,10 +190,63 @@
 
     });
 
+    app.SelectTeamPage = BasePage.extend({
+
+        initialize: function(){
+            BasePage.prototype.initialize.apply(this, arguments);
+
+            this.refreshSparklines();
+            $(window).on('resize', this.refreshSparklines);
+        },
+
+        refreshSparklines: function(){
+            $('.chart').each(function(n, el){
+                var $el = $(el);
+                $.ajax({
+                    url: $el.attr('data-api-url'),
+                    type: 'get',
+                    dataType: 'json',
+                    data: {
+                        days: 1
+                    },
+                    success: _.bind(function(data){
+                        $.plot($el, [{
+                                data: data,
+                                color: '#ebeff3',
+                                shadowSize: 0,
+                                lines: {
+                                    lineWidth: 2,
+                                    show: true,
+                                    fill: true,
+                                    color: '#f6f8fa'
+                            }
+                            }], {
+                                yaxis: {
+                                    min: 0
+                                },
+                                grid: {
+                                    show: false
+                                },
+                                hoverable: false,
+                                legend: {
+                                    noColumns: 5
+                                },
+                                lines: {
+                                    show: false
+                                }
+                            }
+                        );
+                    }, this)
+                });
+            });
+        }
+
+    });
+
     app.GroupDetailsPage = BasePage.extend({
 
         initialize: function(data){
-            BasePage.prototype.initialize.call(this, data);
+            BasePage.prototype.initialize.apply(this, arguments);
 
             this.group_list = new app.GroupListView({
                 className: 'group-list',
@@ -224,6 +273,20 @@
                         window.alert('There was an error changing the public status');
                     }
                 });
+            });
+
+            $('.add-note-btn').click(function(e){
+                var $el = $(this);
+
+                e.preventDefault();
+
+                if ($el.hasClass('selected')) {
+                    $el.removeClass('selected');
+                    $('.add-note-form', $el.parent()).addClass('hide');
+                } else {
+                    $el.addClass('selected');
+                    $('.add-note-form', $el.parent()).removeClass('hide');
+                }
             });
 
             var $event_nav = $('#event_nav');
@@ -308,9 +371,8 @@
     });
 
     app.WallPage = BasePage.extend({
-
         initialize: function(){
-            BasePage.prototype.initialize.call(this, {
+            BasePage.prototype.initialize.apply(this, {
                 realtime: true,
                 pollTime: 3000
             });
@@ -319,8 +381,21 @@
             this.sparkline.height(this.sparkline.parent().height());
             this.stats = $('#stats');
 
+            _.bindAll(this, 'refreshStats');
+
             this.refreshSparkline();
             this.refreshStats();
+        },
+
+        makeDefaultView: function(id){
+            return new app.GroupListView({
+                className: 'group-list',
+                id: id,
+                maxItems: 5,
+                stream: this.options.stream,
+                realtime: this.options.realtime,
+                model: app.models.Group
+            });
         },
 
         refreshSparkline: function(){
@@ -370,7 +445,43 @@
                 success: _.bind(function(data){
                     this.stats.find('[data-stat]').each(function(){
                         var $this = $(this);
-                        $this.find('big').text(data[$this.attr('data-stat')]);
+                        var new_count = data[$this.attr('data-stat')];
+                        var counter = $this.find('big');
+                        var digit = counter.find('span');
+
+                        if (digit.is(':animated'))
+                            return false;
+
+                        if (counter.data('count') == new_count) {
+                            // We are already showing this number
+                            return false;
+                        }
+
+                        counter.data('count', new_count);
+
+                        var replacement = $('<span></span>', {
+                            css: {
+                                top: '-2.1em',
+                                opacity: 0
+                            },
+                            text: new_count
+                        });
+
+                        // The .static class is added when the animation
+                        // completes. This makes it run smoother.
+
+                        digit.before(replacement).animate({
+                            top: '2.5em',
+                            opacity: 0
+                        }, 'fast', function(){
+                            digit.remove();
+                        });
+
+                        replacement.delay(100).animate({
+                            top: 0,
+                            opacity: 1
+                        }, 'fast');
+
                     });
                     window.setTimeout(this.refreshStats, 1000);
                 }, this)
@@ -379,55 +490,36 @@
 
     });
 
-    app.UserListPage = BasePage.extend({
-
-        initialize: function(data){
-            BasePage.prototype.initialize.call(this, data);
-
-            this.list = new app.UserListView({
-                className: 'user-list',
-                id: 'user_list',
-                members: data.users
-            });
-        }
-
-    });
-
     app.AddTeamMemberPage = BasePage.extend({
-        initialize: function(data){
-            BasePage.prototype.initialize.call(this, data);
-
-            app.utils.makeSearchableUsersInput('form input[name=add-user]');
-        }
     });
 
     app.AccessGroupMembersPage = BasePage.extend({
-        initialize: function(data){
-            BasePage.prototype.initialize.call(this, data);
+        initialize: function(){
+            BasePage.prototype.initialize.apply(this, arguments);
 
             app.utils.makeSearchableUsersInput('form input[name=user]');
         }
     });
 
     app.AccessGroupProjectsPage = BasePage.extend({
-        initialize: function(data){
-            BasePage.prototype.initialize.call(this, data);
+        initialize: function(){
+            BasePage.prototype.initialize.apply(this, arguments);
 
             app.utils.makeSearchableProjectsInput('form input[name=project]');
         }
     });
 
     app.TeamDetailsPage = BasePage.extend({
-        initialize: function(data){
-            BasePage.prototype.initialize.call(this, data);
+        initialize: function(){
+            BasePage.prototype.initialize.apply(this, arguments);
 
             app.utils.makeSearchableUsersInput('form input[name=owner]');
         }
     });
 
     app.ProjectDetailsPage = BasePage.extend({
-        initialize: function initialize(data){
-            BasePage.prototype.initialize.call(this, data);
+        initialize: function(){
+            BasePage.prototype.initialize.apply(this, arguments);
 
             app.utils.makeSearchableUsersInput('form input[name=owner]');
 
@@ -481,12 +573,50 @@
         }
     });
 
+    app.ProjectNotificationsPage = BasePage.extend({
+        initialize: function(){
+            BasePage.prototype.initialize.apply(this, arguments);
+
+            $("input[type=range]").each(_.bind(function loop(n, el){
+                var $el = $(el),
+                    min = parseInt($el.attr('min'), 10),
+                    max = parseInt($el.attr('max'), 10),
+                    step = parseInt($el.attr('step'), 10),
+                    $value = $('<span class="value"></span>');
+
+                $el.on("slider:ready", _.bind(function sliderready(event, data) {
+                    $value.appendTo(data.el);
+                    $value.html(this.formatThreshold(data.value));
+                }, this)).on("slider:changed", _.bind(function sliderchanged(event, data) {
+                    $value.html(this.formatThreshold(data.value));
+                }, this)).simpleSlider({
+                    range: [min, max],
+                    step: step,
+                    snap: true
+                });
+            }, this));
+
+            $("#tag_list input").each(function(_, el){
+                $(el).addClass('span6');
+                app.utils.makeSearchableTagsInput(el);
+            });
+        },
+
+        formatThreshold: function formatThreshold(value) {
+            if (!value) {
+                return 'Disabled';
+            }
+            return value + '%';
+        }
+
+    });
+
     app.NewProjectPage = BasePage.extend({
 
         initialize: function(data){
             this.el = $(data.el);
 
-            BasePage.prototype.initialize.call(this, data);
+            BasePage.prototype.initialize.apply(this, arguments);
 
             if (this.options.canSelectTeam && this.options.canCreateTeam) {
                 $('#new_team').hide();

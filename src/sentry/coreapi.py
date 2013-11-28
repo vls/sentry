@@ -15,26 +15,25 @@ import logging
 import uuid
 import zlib
 
-from django.contrib.auth.models import User
+from django.conf import settings
 from django.utils.encoding import smart_str
 
 from sentry.app import env
-from sentry.conf import settings
+from sentry.constants import (
+    DEFAULT_LOG_LEVEL, LOG_LEVELS, MAX_MESSAGE_LENGTH, MAX_CULPRIT_LENGTH,
+    MAX_TAG_VALUE_LENGTH, MAX_TAG_KEY_LENGTH)
 from sentry.exceptions import InvalidTimestamp
-from sentry.models import Project, ProjectKey, TeamMember, Team
-from sentry.plugins import plugins
-from sentry.tasks.store import store_event
+from sentry.models import Project, ProjectKey
+from sentry.tasks.store import preprocess_event
 from sentry.utils import is_float, json
 from sentry.utils.auth import parse_auth_header
 from sentry.utils.imports import import_string
-from sentry.utils.queue import maybe_delay
-from sentry.utils.strings import decompress
+from sentry.utils.strings import decompress, truncatechars
 
 
 logger = logging.getLogger('sentry.coreapi.errors')
 
-MAX_CULPRIT_LENGTH = 200
-MAX_MESSAGE_LENGTH = 5000
+LOG_LEVEL_REVERSE_MAP = dict((v, k) for k, v in LOG_LEVELS.iteritems())
 
 INTERFACE_ALIASES = {
     'exception': 'sentry.interfaces.Exception',
@@ -88,7 +87,24 @@ class APITimestampExpired(APIError):
     http_status = 410
 
 
-def client_metadata(client=None, exception=None, tags=None, extra=None):
+class APIRateLimited(APIError):
+    http_status = 429
+    msg = 'Creation of this event was denied due to rate limiting.'
+
+
+def get_interface(name):
+    if name not in settings.SENTRY_ALLOWED_INTERFACES:
+        raise ValueError
+
+    try:
+        interface = import_string(name)
+    except Exception:
+        raise ValueError('Unable to load interface: %s' % (name,))
+
+    return interface
+
+
+def client_metadata(client=None, project=None, exception=None, tags=None, extra=None):
     if not extra:
         extra = {}
     if not tags:
@@ -97,10 +113,18 @@ def client_metadata(client=None, exception=None, tags=None, extra=None):
     extra['client'] = client
     extra['request'] = env.request
     extra['tags'] = tags
+    if project:
+        extra['project_slug'] = project.slug
+        extra['project_id'] = project.id
+        if project.team:
+            extra['team_slug'] = project.team.slug
+            extra['team_id'] = project.team.id
 
     tags['client'] = client
     if exception:
         tags['exc_type'] = type(exception).__name__
+    if project and project.team:
+        tags['project'] = '%s/%s' % (project.team.slug, project.slug)
 
     result = {'extra': extra}
     if exception:
@@ -114,7 +138,11 @@ def extract_auth_vars(request):
     elif request.META.get('HTTP_AUTHORIZATION', '').startswith('Sentry'):
         return parse_auth_header(request.META['HTTP_AUTHORIZATION'])
     else:
-        return request.GET
+        return dict(
+            (k, request.GET[k])
+            for k in request.GET.iterkeys()
+            if k.startswith('sentry_')
+        )
 
 
 def project_from_auth_vars(auth_vars):
@@ -131,98 +159,7 @@ def project_from_auth_vars(auth_vars):
 
     project = Project.objects.get_from_cache(pk=pk.project_id)
 
-    if pk.user:
-        try:
-            team = Team.objects.get_from_cache(pk=project.team_id)
-        except Team.DoesNotExist:
-            raise APIUnauthorized('Member does not have access to project')
-
-        try:
-            TeamMember.objects.get(team=team, user=pk.user, is_active=True)
-        except TeamMember.DoesNotExist:
-            raise APIUnauthorized('Member does not have access to project')
-
-        # We have to refetch this as it may have been caught
-        pk.user = User.objects.get(id=pk.user_id)
-        if not pk.user.is_active:
-            raise APIUnauthorized('Account is not active')
-
     return project, pk.user
-
-
-def project_from_api_key_and_id(api_key, project_id):
-    """
-    Given a public api key and a project id returns
-    a project instance or throws APIUnauthorized.
-    """
-    try:
-        pk = ProjectKey.objects.get_from_cache(public_key=api_key)
-    except ProjectKey.DoesNotExist:
-        raise APIUnauthorized('Invalid api key')
-
-    if str(project_id).isdigit():
-        if str(pk.project_id) != str(project_id):
-            raise APIUnauthorized('Invalid project id')
-    else:
-        if str(pk.project.slug) != str(project_id):
-            raise APIUnauthorized('Invalid project id')
-
-    project = Project.objects.get_from_cache(pk=pk.project_id)
-
-    if pk.user:
-        team = Team.objects.get_from_cache(pk=project.team_id)
-
-        try:
-            tm = TeamMember.objects.get(team=team, user=pk.user, is_active=True)
-        except TeamMember.DoesNotExist:
-            raise APIUnauthorized('Member does not have access to project')
-
-        # We have to refetch this as it may have been caught
-        pk.user = User.objects.get(id=pk.user_id)
-        if not pk.user.is_active:
-            raise APIUnauthorized('Account is not active')
-
-        tm.project = project
-
-        result = plugins.first('has_perm', tm.user, 'create_event', project)
-        if result is False:
-            raise APIForbidden('Creation of this event was blocked')
-
-    return project
-
-
-def project_from_id(request):
-    """
-    Given a request returns a project instance or throws
-    APIUnauthorized.
-    """
-    if not request.user.is_active:
-        raise APIUnauthorized('Account is not active')
-
-    try:
-        project = Project.objects.get_from_cache(pk=request.GET['project_id'])
-    except Project.DoesNotExist:
-        raise APIUnauthorized('Invalid project')
-
-    try:
-        team = Team.objects.get_from_cache(pk=project.team_id)
-    except Project.DoesNotExist:
-        raise APIUnauthorized('Member does not have access to project')
-
-    try:
-        TeamMember.objects.get(
-            user=request.user,
-            team=team,
-            is_active=True,
-        )
-    except TeamMember.DoesNotExist:
-        raise APIUnauthorized('Member does not have access to project')
-
-    result = plugins.first('has_perm', request.user, 'create_event', project)
-    if result is False:
-        raise APIForbidden('Creation of this event was blocked')
-
-    return project
 
 
 def decode_and_decompress_data(encoded_data):
@@ -258,7 +195,8 @@ def ensure_valid_project_id(desired_project, data, client=None):
     # matches with the signed project.
     if desired_project and data.get('project'):
         if str(data.get('project')) not in [str(desired_project.id), desired_project.slug]:
-            logger.info('Project ID mismatch: %s != %s', desired_project.id, desired_project.slug,
+            logger.info(
+                'Project ID mismatch: %s != %s', desired_project.id, desired_project.slug,
                 **client_metadata(client))
             raise APIForbidden('Invalid credentials')
         data['project'] = desired_project.id
@@ -301,20 +239,23 @@ def validate_data(project, data, client=None):
     elif not isinstance(data['message'], basestring):
         raise APIError('Invalid value for message')
     elif len(data['message']) > MAX_MESSAGE_LENGTH:
-        logger.error('Truncated value for message due to length (%d chars)', len(data['message']),
-            **client_metadata(client))
-        data['message'] = data['message'][:MAX_MESSAGE_LENGTH]
+        logger.info(
+            'Truncated value for message due to length (%d chars)',
+            len(data['message']), **client_metadata(client, project))
+        data['message'] = truncatechars(data['message'], MAX_MESSAGE_LENGTH)
 
     if data.get('culprit') and len(data['culprit']) > MAX_CULPRIT_LENGTH:
-        logger.error('Truncated value for culprit due to length (%d chars)', len(data['culprit']),
-            **client_metadata(client))
-        data['culprit'] = data['culprit'][:MAX_CULPRIT_LENGTH]
+        logger.info(
+            'Truncated value for culprit due to length (%d chars)',
+            len(data['culprit']), **client_metadata(client, project))
+        data['culprit'] = truncatechars(data['culprit'], MAX_CULPRIT_LENGTH)
 
     if not data.get('event_id'):
         data['event_id'] = uuid.uuid4().hex
     if len(data['event_id']) > 32:
-        logger.error('Discarded value for event_id due to length (%d chars)', len(data['event_id']),
-            **client_metadata(client))
+        logger.info(
+            'Discarded value for event_id due to length (%d chars)',
+            len(data['event_id']), **client_metadata(client, project))
         data['event_id'] = uuid.uuid4().hex
 
     if 'timestamp' in data:
@@ -322,68 +263,136 @@ def validate_data(project, data, client=None):
             process_data_timestamp(data)
         except InvalidTimestamp, e:
             # Log the error, remove the timestamp, and continue
-            logger.info('Discarded invalid value for timestamp: %r', data['timestamp'],
-                **client_metadata(client, exception=e))
+            logger.info(
+                'Discarded invalid value for timestamp: %r', data['timestamp'],
+                **client_metadata(client, project, exception=e))
             del data['timestamp']
 
     if data.get('modules') and type(data['modules']) != dict:
-        logger.error('Discarded invalid type for modules: %s', type(data['modules']),
-            **client_metadata(client))
+        logger.info(
+            'Discarded invalid type for modules: %s',
+            type(data['modules']), **client_metadata(client, project))
         del data['modules']
 
-    if data.get('extra') and type(data['extra']) != dict:
-        logger.error('Discarded invalid type for extra: %s', type(data['extra']),
-            **client_metadata(client))
+    if data.get('extra') is not None and type(data['extra']) != dict:
+        logger.info(
+            'Discarded invalid type for extra: %s',
+            type(data['extra']), **client_metadata(client, project))
         del data['extra']
+
+    if data.get('tags') is not None:
+        if type(data['tags']) == dict:
+            data['tags'] = data['tags'].items()
+        elif not isinstance(data['tags'], (list, tuple)):
+            logger.info(
+                'Discarded invalid type for tags: %s',
+                type(data['tags']), **client_metadata(client, project))
+            del data['tags']
+
+    if data.get('tags'):
+        # remove any values which are over 32 characters
+        tags = []
+        for pair in data['tags']:
+            try:
+                k, v = pair
+            except ValueError:
+                logger.info('Discarded invalid tag value: %r',
+                            pair, **client_metadata(client, project))
+                continue
+
+            if not isinstance(k, basestring):
+                try:
+                    k = unicode(k)
+                except Exception:
+                    logger.info('Discarded invalid tag key: %r',
+                                type(k), **client_metadata(client, project))
+                    continue
+
+            if not isinstance(v, basestring):
+                try:
+                    v = unicode(v)
+                except Exception:
+                    logger.info('Discarded invalid tag value: %s=%r',
+                                k, type(v), **client_metadata(client, project))
+                    continue
+            if len(k) > MAX_TAG_KEY_LENGTH or len(v) > MAX_TAG_VALUE_LENGTH:
+                logger.info('Discarded invalid tag: %s=%s',
+                            k, v, **client_metadata(client, project))
+                continue
+            tags.append((k, v))
+        data['tags'] = tags
 
     for k in data.keys():
         if k in RESERVED_FIELDS:
             continue
 
         if not data[k]:
-            logger.info('Ignored empty interface value: %s', k, **client_metadata(client))
+            logger.info(
+                'Ignored empty interface value: %s', k,
+                **client_metadata(client, project))
             del data[k]
             continue
 
         import_path = INTERFACE_ALIASES.get(k, k)
 
         if '.' not in import_path:
-            logger.warning('Ignored unknown attribute: %s', k, **client_metadata(client))
+            logger.info(
+                'Ignored unknown attribute: %s', k,
+                **client_metadata(client, project))
             del data[k]
             continue
 
         try:
-            interface = import_string(import_path)
-        except (ImportError, AttributeError), e:
-            logger.warning('Invalid unknown attribute: %s', k, **client_metadata(client, exception=e))
+            interface = get_interface(import_path)
+        except ValueError:
+            logger.info(
+                'Invalid unknown attribute: %s', k,
+                **client_metadata(client, project))
             del data[k]
             continue
 
         value = data.pop(k)
         try:
-            inst = interface(**value)
+            # HACK: exception allows you to pass the value as a list
+            # so let's try to actually support that
+            if isinstance(value, dict):
+                inst = interface(**value)
+            else:
+                inst = interface(value)
             inst.validate()
             data[import_path] = inst.serialize()
         except Exception, e:
             if isinstance(e, AssertionError):
-                log = logger.warning
+                log = logger.info
             else:
                 log = logger.error
             log('Discarded invalid value for interface: %s', k,
-                **client_metadata(client, exception=e, extra={'value': value}))
+                **client_metadata(client, project, exception=e, extra={'value': value}))
 
-    level = data.get('level') or settings.DEFAULT_LOG_LEVEL
+    level = data.get('level') or DEFAULT_LOG_LEVEL
     if isinstance(level, basestring) and not level.isdigit():
         # assume it's something like 'warning'
         try:
-            data['level'] = settings.LOG_LEVEL_REVERSE_MAP[level]
+            data['level'] = LOG_LEVEL_REVERSE_MAP[level]
         except KeyError, e:
-            logger.warning('Discarded invalid logger value: %s', level, **client_metadata(client, exception=e))
-            data['level'] = settings.LOG_LEVEL_REVERSE_MAP.get(settings.DEFAULT_LOG_LEVEL,
-                settings.DEFAULT_LOG_LEVEL)
+            logger.info(
+                'Discarded invalid logger value: %s', level,
+                **client_metadata(client, project, exception=e))
+            data['level'] = LOG_LEVEL_REVERSE_MAP.get(
+                DEFAULT_LOG_LEVEL, DEFAULT_LOG_LEVEL)
 
     return data
 
 
+def ensure_has_ip(data, ip_address):
+    if data.get('sentry.interfaces.Http', {}).get('env', {}).get('REMOTE_ADDR'):
+        return
+
+    if data.get('sentry.interfaces.User', {}).get('ip_address'):
+        return
+
+    data.setdefault('sentry.interfaces.User', {})['ip_address'] = ip_address
+
+
 def insert_data_to_database(data):
-    maybe_delay(store_event, data=data)
+    preprocess_event.delay(data=data)

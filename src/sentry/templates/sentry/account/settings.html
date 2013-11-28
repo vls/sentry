@@ -1,21 +1,10 @@
-{% extends "sentry/account/base.html" %}
+{% extends "sentry/bases/account.html" %}
 
-{% load url from future %}
 {% load crispy_forms_tags %}
 {% load i18n %}
 {% load sentry_helpers %}
 
 {% block title %}{% trans "Account Settings" %} | {{ block.super }}{% endblock %}
-
-{% block breadcrumb %}
-    {{ block.super }}
-    <li class="divider"></li>
-    <li><a href="{% url 'sentry-account-settings' %}">{% trans "Account" %}</a></li>
-{% endblock %}
-
-{% block heading %}
-    {% trans "Account Settings" %}
-{% endblock %}
 
 {% block inner %}
     <form action="" method="post">
@@ -24,7 +13,7 @@
         <p>{% trans "To make changes to your account, you must first enter your current password." %}</p>
         {% with form.old_password as field %}
             {% if field %}
-                {% include "sentry/partial/_form_field.html" %}
+                {{ field|as_crispy_field }}
             {% endif %}
         {% endwith %}
         <hr>
@@ -35,13 +24,10 @@
             </div>
         </fieldset>
         {% with form.first_name as field %}
-            {% include "sentry/partial/_form_field.html" %}
+            {{ field|as_crispy_field }}
         {% endwith %}
         {% with form.email as field %}
-            {% include "sentry/partial/_form_field.html" %}
-        {% endwith %}
-        {% with form.language as field %}
-            {% include "sentry/partial/_form_field.html" %}
+            {{ field|as_crispy_field }}
         {% endwith %}
         <fieldset class="control-group">
             <label>Avatar</label>
@@ -53,7 +39,7 @@
         <hr>
         <p>{% trans "You may also optionally change your password." %}</p>
         {% with form.new_password as field %}
-            {% include "sentry/partial/_form_field.html" %}
+            {{ field|as_crispy_field }}
         {% endwith %}
 
         <fieldset class="form-actions">

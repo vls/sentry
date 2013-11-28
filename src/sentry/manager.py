@@ -8,39 +8,37 @@ sentry.manager
 
 from __future__ import with_statement
 
-from collections import defaultdict
 import datetime
 import hashlib
-import itertools
 import logging
-import re
-import warnings
-import weakref
 import time
+import warnings
+import uuid
 
 from celery.signals import task_postrun
-from django.conf import settings as dj_settings
+from django.conf import settings
+from django.contrib.auth.models import UserManager
 from django.core.signals import request_finished
 from django.db import models, transaction, IntegrityError
 from django.db.models import Sum
-from django.db.models.signals import post_save, post_delete, post_init, class_prepared
 from django.utils import timezone
 from django.utils.datastructures import SortedDict
-from django.utils.encoding import force_unicode
 
 from raven.utils.encoding import to_string
 from sentry import app
-from sentry.conf import settings
-from sentry.constants import STATUS_RESOLVED, STATUS_UNRESOLVED, MINUTE_NORMALIZATION
+from sentry.constants import (
+    STATUS_RESOLVED, STATUS_UNRESOLVED, MINUTE_NORMALIZATION,
+    MAX_EXTRA_VARIABLE_SIZE, LOG_LEVELS, DEFAULT_LOGGER_NAME,
+    MAX_CULPRIT_LENGTH)
+from sentry.db.models import BaseManager
 from sentry.processors.base import send_group_processors
 from sentry.signals import regression_signal
 from sentry.tasks.index import index_event
-from sentry.tasks.fetch_source import fetch_javascript_source
-from sentry.utils.cache import cache, memoize, Lock
+from sentry.utils.cache import cache, memoize
 from sentry.utils.dates import get_sql_date_trunc, normalize_datetime
 from sentry.utils.db import get_db_engine, has_charts, attach_foreignkey
-from sentry.utils.models import create_or_update, make_key
-from sentry.utils.queue import maybe_delay
+from sentry.utils.safe import safe_execute, trim, trim_dict, trim_frames
+from sentry.utils.strings import strip
 
 logger = logging.getLogger('sentry.errors')
 
@@ -58,177 +56,6 @@ def get_checksum_from_event(event):
                 hash.update(to_string(r))
             return hash.hexdigest()
     return hashlib.md5(to_string(event.message)).hexdigest()
-
-
-class BaseManager(models.Manager):
-    lookup_handlers = {
-        'iexact': lambda x: x.upper(),
-    }
-
-    def __init__(self, *args, **kwargs):
-        self.cache_fields = kwargs.pop('cache_fields', [])
-        self.cache_ttl = kwargs.pop('cache_ttl', 60 * 5)
-        self.__cache = weakref.WeakKeyDictionary()
-        super(BaseManager, self).__init__(*args, **kwargs)
-
-    def __getstate__(self):
-        d = self.__dict__.copy()
-        # we cant serialize weakrefs
-        del d['_BaseManager__cache']
-        return d
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self.__cache = weakref.WeakKeyDictionary()
-
-    def __class_prepared(self, sender, **kwargs):
-        """
-        Given the cache is configured, connects the required signals for invalidation.
-        """
-        if not self.cache_fields:
-            return
-        post_init.connect(self.__post_init, sender=sender, weak=False)
-        post_save.connect(self.__post_save, sender=sender, weak=False)
-        post_delete.connect(self.__post_delete, sender=sender, weak=False)
-
-    def __cache_state(self, instance):
-        """
-        Updates the tracked state of an instance.
-        """
-        if instance.pk:
-            self.__cache[instance] = dict((f, getattr(instance, f)) for f in self.cache_fields)
-        else:
-            self.__cache[instance] = UNSAVED
-
-    def __post_init(self, instance, **kwargs):
-        """
-        Stores the initial state of an instance.
-        """
-        self.__cache_state(instance)
-
-    def __post_save(self, instance, **kwargs):
-        """
-        Pushes changes to an instance into the cache, and removes invalid (changed)
-        lookup values.
-        """
-        pk_name = instance._meta.pk.name
-        pk_names = ('pk', pk_name)
-        pk_val = instance.pk
-        for key in self.cache_fields:
-            if key in pk_names:
-                continue
-            # store pointers
-            cache.set(self.__get_lookup_cache_key(**{key: getattr(instance, key)}), pk_val, self.cache_ttl)  # 1 hour
-
-        # Ensure we don't serialize the database into the cache
-        db = instance._state.db
-        instance._state.db = None
-        # store actual object
-        cache.set(self.__get_lookup_cache_key(**{pk_name: pk_val}), instance, self.cache_ttl)
-        instance._state.db = db
-
-        # Kill off any keys which are no longer valid
-        if instance in self.__cache:
-            for key in self.cache_fields:
-                if key not in self.__cache[instance]:
-                    continue
-                value = self.__cache[instance][key]
-                if value != getattr(instance, key):
-                    cache.delete(self.__get_lookup_cache_key(**{key: value}))
-
-        self.__cache_state(instance)
-
-    def __post_delete(self, instance, **kwargs):
-        """
-        Drops instance from all cache storages.
-        """
-        pk_name = instance._meta.pk.name
-        for key in self.cache_fields:
-            if key in ('pk', pk_name):
-                continue
-            # remove pointers
-            cache.delete(self.__get_lookup_cache_key(**{key: getattr(instance, key)}))
-        # remove actual object
-        cache.delete(self.__get_lookup_cache_key(**{pk_name: instance.pk}))
-
-    def __get_lookup_cache_key(self, **kwargs):
-        return make_key(self.model, 'modelcache', kwargs)
-
-    def contribute_to_class(self, model, name):
-        super(BaseManager, self).contribute_to_class(model, name)
-        class_prepared.connect(self.__class_prepared, sender=model)
-
-    def get_from_cache(self, **kwargs):
-        """
-        Wrapper around QuerySet.get which supports caching of the
-        intermediate value.  Callee is responsible for making sure
-        the cache key is cleared on save.
-        """
-        if not self.cache_fields or len(kwargs) > 1:
-            return self.get(**kwargs)
-
-        key, value = kwargs.items()[0]
-        pk_name = self.model._meta.pk.name
-        if key == 'pk':
-            key = pk_name
-
-        # Kill __exact since it's the default behavior
-        if key.endswith('__exact'):
-            key = key.split('__exact', 1)[0]
-
-        if key in self.cache_fields or key == pk_name:
-            cache_key = self.__get_lookup_cache_key(**{key: value})
-
-            retval = cache.get(cache_key)
-            if retval is None:
-                result = self.get(**kwargs)
-                # Ensure we're pushing it into the cache
-                self.__post_save(instance=result)
-                return result
-
-            # If we didn't look up by pk we need to hit the reffed
-            # key
-            if key != pk_name:
-                return self.get_from_cache(**{pk_name: retval})
-
-            if type(retval) != self.model:
-                if settings.DEBUG:
-                    raise ValueError('Unexpected value type returned from cache')
-                logger.error('Cache response returned invalid value %r', retval)
-                return self.get(**kwargs)
-
-            return retval
-        else:
-            return self.get(**kwargs)
-
-    def get_or_create(self, _cache=False, **kwargs):
-        """
-        A modified version of Django's get_or_create which will create a distributed
-        lock (using the cache backend) whenever it hits the create clause.
-        """
-        defaults = kwargs.pop('defaults', {})
-
-        # before locking attempt to fetch the instance
-        try:
-            if _cache:
-                return self.get_from_cache(**kwargs), False
-            return self.get(**kwargs), False
-        except self.model.DoesNotExist:
-            pass
-        lock_key = make_key(self.model, 'lock', kwargs)
-
-        # instance not found, lets grab a lock and attempt to create it
-        with Lock(lock_key):
-            # its important we get() before create() to ensure that if
-            # someone beat us to creating it from the time we did our very
-            # first .get(), that we get the result back as we cannot
-            # rely on unique constraints existing
-            instance, created = super(BaseManager, self).get_or_create(defaults=defaults, **kwargs)
-
-        return instance, created
-
-    def create_or_update(self, **kwargs):
-        return create_or_update(self.model, **kwargs)
 
 
 class ScoreClause(object):
@@ -257,17 +84,21 @@ class ScoreClause(object):
 def count_limit(count):
     # TODO: could we do something like num_to_store = max(math.sqrt(100*count)+59, 200) ?
     # ~ 150 * ((log(n) - 1.5) ^ 2 - 0.25)
-    for amount, sample_rate in settings.SAMPLE_RATES:
+    for amount, sample_rate in settings.SENTRY_SAMPLE_RATES:
         if count <= amount:
             return sample_rate
-    return settings.MAX_SAMPLE_RATE
+    return settings.SENTRY_MAX_SAMPLE_RATE
 
 
 def time_limit(silence):  # ~ 3600 per hour
-    for amount, sample_rate in settings.SAMPLE_TIMES:
+    for amount, sample_rate in settings.SENTRY_SAMPLE_TIMES:
         if silence >= amount:
             return sample_rate
-    return settings.MAX_SAMPLE_TIME
+    return settings.SENTRY_MAX_SAMPLE_TIME
+
+
+class UserManager(BaseManager, UserManager):
+    pass
 
 
 class ChartMixin(object):
@@ -377,47 +208,154 @@ class ChartMixin(object):
 class GroupManager(BaseManager, ChartMixin):
     use_for_related_fields = True
 
-    @transaction.commit_on_success
+    def normalize_event_data(self, data):
+        # TODO(dcramer): store http.env.REMOTE_ADDR as user.ip
+        # First we pull out our top-level (non-data attr) kwargs
+        if not data.get('level') or data['level'] not in LOG_LEVELS:
+            data['level'] = logging.ERROR
+        if not data.get('logger'):
+            data['logger'] = DEFAULT_LOGGER_NAME
+
+        timestamp = data.get('timestamp')
+        if not timestamp:
+            timestamp = timezone.now()
+
+        # We must convert date to local time so Django doesn't mess it up
+        # based on TIME_ZONE
+        if settings.TIME_ZONE:
+            if not timezone.is_aware(timestamp):
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+        elif timezone.is_aware(timestamp):
+            timestamp = timestamp.replace(tzinfo=None)
+        data['timestamp'] = timestamp
+
+        if not data.get('event_id'):
+            data['event_id'] = uuid.uuid4().hex
+
+        data.setdefault('message', None)
+        data.setdefault('culprit', None)
+        data.setdefault('time_spent', None)
+        data.setdefault('server_name', None)
+        data.setdefault('site', None)
+        data.setdefault('checksum', None)
+        data.setdefault('platform', None)
+        data.setdefault('extra', {})
+
+        tags = data.get('tags')
+        if not tags:
+            tags = []
+        # full support for dict syntax
+        elif isinstance(tags, dict):
+            tags = tags.items()
+        # prevent [tag, tag, tag] (invalid) syntax
+        elif not all(len(t) == 2 for t in tags):
+            tags = []
+        else:
+            tags = list(tags)
+
+        data['tags'] = tags
+        data['message'] = strip(data['message'])
+        data['culprit'] = strip(data['culprit'])
+
+        if not isinstance(data['extra'], dict):
+            # throw it away
+            data['extra'] = {}
+
+        trim_dict(data['extra'], max_size=MAX_EXTRA_VARIABLE_SIZE)
+
+        if 'sentry.interfaces.Exception' in data:
+            if 'values' not in data['sentry.interfaces.Exception']:
+                data['sentry.interfaces.Exception'] = {
+                    'values': [data['sentry.interfaces.Exception']]
+                }
+
+            # convert stacktrace + exception into expanded exception
+            if 'sentry.interfaces.Stacktrace' in data:
+                data['sentry.interfaces.Exception']['values'][0]['stacktrace'] = data.pop('sentry.interfaces.Stacktrace')
+
+            for exc_data in data['sentry.interfaces.Exception']['values']:
+                for key in ('type', 'module', 'value'):
+                    value = exc_data.get(key)
+                    if value:
+                        exc_data[key] = trim(value)
+                if exc_data.get('stacktrace'):
+                    trim_frames(exc_data['stacktrace'])
+                    for frame in exc_data['stacktrace']['frames']:
+                        stack_vars = frame.get('vars', {})
+                        trim_dict(stack_vars)
+
+        if 'sentry.interfaces.Stacktrace' in data:
+            trim_frames(data['sentry.interfaces.Stacktrace'])
+            for frame in data['sentry.interfaces.Stacktrace']['frames']:
+                stack_vars = frame.get('vars', {})
+                trim_dict(stack_vars)
+
+        if 'sentry.interfaces.Message' in data:
+            msg_data = data['sentry.interfaces.Message']
+            trim(msg_data['message'], 1024)
+            if msg_data.get('params'):
+                msg_data['params'] = trim(msg_data['params'])
+
+        if 'sentry.interfaces.Http' in data:
+            http_data = data['sentry.interfaces.Http']
+            for key in ('cookies', 'querystring', 'headers', 'env', 'url'):
+                value = http_data.get(key)
+                if not value:
+                    continue
+
+                if type(value) == dict:
+                    trim_dict(value)
+                else:
+                    http_data[key] = trim(value)
+
+            value = http_data.get('data')
+            if value:
+                http_data['data'] = trim(value, 2048)
+
+            # default the culprit to the url
+            if not data['culprit']:
+                data['culprit'] = trim(strip(http_data.get('url')), MAX_CULPRIT_LENGTH)
+
+        return data
+
     def from_kwargs(self, project, **kwargs):
+        data = self.normalize_event_data(kwargs)
+
+        return self.save_data(project, data)
+
+    @transaction.commit_on_success
+    def save_data(self, project, data, raw=False):
         # TODO: this function is way too damn long and needs refactored
         # the inner imports also suck so let's try to move it away from
         # the objects manager
 
         # TODO: culprit should default to "most recent" frame in stacktraces when
         # it's not provided.
+        from sentry.plugins import plugins
+        from sentry.models import Event, Project, EventMapping
 
-        from sentry.models import Event, Project
-
-        project = Project.objects.get_from_cache(pk=project)
+        project = Project.objects.get_from_cache(id=project)
 
         # First we pull out our top-level (non-data attr) kwargs
-        event_id = kwargs.pop('event_id', None)
-        message = kwargs.pop('message', None)
-        culprit = kwargs.pop('culprit', None)
-        level = kwargs.pop('level', None) or logging.ERROR
-        time_spent = kwargs.pop('time_spent', None)
-        logger_name = kwargs.pop('logger', None) or settings.DEFAULT_LOGGER_NAME
-        server_name = kwargs.pop('server_name', None)
-        site = kwargs.pop('site', None)
-        date = kwargs.pop('timestamp', None) or timezone.now()
-        checksum = kwargs.pop('checksum', None)
-        tags = kwargs.pop('tags', [])
-        platform = kwargs.pop('platform', None)
+        event_id = data.pop('event_id')
+        message = data.pop('message')
+        culprit = data.pop('culprit')
+        level = data.pop('level')
+        time_spent = data.pop('time_spent')
+        logger_name = data.pop('logger')
+        server_name = data.pop('server_name')
+        site = data.pop('site')
+        date = data.pop('timestamp')
+        checksum = data.pop('checksum')
+        platform = data.pop('platform')
 
-        # full support for dict syntax
-        if isinstance(tags, dict):
-            tags = tags.items()
+        if 'sentry.interfaces.Exception' in data:
+            if 'values' not in data['sentry.interfaces.Exception']:
+                data['sentry.interfaces.Exception'] = {'values': [data['sentry.interfaces.Exception']]}
 
-        # We must convert date to local time so Django doesn't mess it up
-        # based on TIME_ZONE
-        if dj_settings.TIME_ZONE:
-            if not timezone.is_aware(date):
-                date = date.replace(tzinfo=timezone.utc)
-        elif timezone.is_aware(date):
-            date = date.replace(tzinfo=None)
-
-        data = kwargs
-        data['tags'] = tags
+            # convert stacktrace + exception into expanded exception
+            if 'sentry.interfaces.Stacktrace' in data:
+                data['sentry.interfaces.Exception']['values'][0]['stacktrace'] = data.pop('sentry.interfaces.Stacktrace')
 
         kwargs = {
             'level': level,
@@ -452,53 +390,89 @@ class GroupManager(BaseManager, ChartMixin):
             'time_spent_count': time_spent and 1 or 0,
         })
 
+        tags = data['tags']
+        tags.append(('level', LOG_LEVELS[level]))
+        if logger:
+            tags.append(('logger', logger_name))
+        if server_name:
+            tags.append(('server_name', server_name))
+        if site:
+            tags.append(('site', site))
+
+        for plugin in plugins.for_project(project):
+            added_tags = safe_execute(plugin.get_tags, event)
+            if added_tags:
+                tags.extend(added_tags)
+
         try:
-            group, is_new, is_sample = self._create_group(event, tags=tags, **group_kwargs)
-        except Exception, exc:
+            group, is_new, is_sample = self._create_group(
+                event=event,
+                tags=data['tags'],
+                **group_kwargs
+            )
+        except Exception as exc:
             # TODO: should we mail admins when there are failures?
             try:
                 logger.exception(u'Unable to process log entry: %s', exc)
             except Exception, exc:
                 warnings.warn(u'Unable to process log entry: %s', exc)
-
             return
+
+        using = group._state.db
 
         event.group = group
 
         # save the event unless its been sampled
         if not is_sample:
+            sid = transaction.savepoint(using=using)
             try:
                 event.save()
             except IntegrityError:
-                transaction.rollback_unless_managed(using=group._state.db)
+                transaction.savepoint_rollback(sid, using=using)
                 return event
+            transaction.savepoint_commit(sid, using=using)
 
-        transaction.commit_unless_managed(using=group._state.db)
+        sid = transaction.savepoint(using=using)
+        try:
+            EventMapping.objects.create(
+                project=project, group=group, event_id=event_id)
+        except IntegrityError:
+            transaction.savepoint_rollback(sid, using=using)
+            return event
+        transaction.savepoint_commit(sid, using=using)
+        transaction.commit_unless_managed(using=using)
 
-        if settings.USE_SEARCH:
-            try:
-                maybe_delay(index_event, event)
-            except Exception, e:
-                transaction.rollback_unless_managed(using=group._state.db)
-                logger.exception(u'Error indexing document: %s', e)
+        if not raw:
+            send_group_processors(
+                group=group,
+                event=event,
+                is_new=is_new,
+                is_sample=is_sample
+            )
 
-        if settings.SCRAPE_JAVASCRIPT_CONTEXT and event.platform == 'javascript' and not is_sample:
-            try:
-                maybe_delay(fetch_javascript_source, event, expires=900)
-            except Exception, e:
-                transaction.rollback_unless_managed(using=group._state.db)
-                logger.exception(u'Error fetching javascript source: %s', e)
+        if getattr(settings, 'SENTRY_INDEX_SEARCH', settings.SENTRY_USE_SEARCH):
+            index_event.delay(event)
 
-        if is_new:
-            try:
-                regression_signal.send_robust(sender=self.model, instance=group)
-            except Exception, e:
-                transaction.rollback_unless_managed(using=group._state.db)
-                logger.exception(u'Error sending regression signal: %s', e)
-
-        send_group_processors(group=group, event=event, is_new=is_new, is_sample=is_sample)
+        # TODO: move this to the queue
+        if is_new and not raw:
+            regression_signal.send_robust(sender=self.model, instance=group)
 
         return event
+
+    def should_sample(self, group, event):
+        if not settings.SENTRY_SAMPLE_DATA:
+            return False
+
+        silence_timedelta = event.datetime - group.last_seen
+        silence = silence_timedelta.days * 86400 + silence_timedelta.seconds
+
+        if group.times_seen % count_limit(group.times_seen):
+            return False
+
+        if group.times_seen % time_limit(silence):
+            return False
+
+        return True
 
     def _create_group(self, event, tags=None, **kwargs):
         from sentry.models import ProjectCountByMinute, GroupCountByMinute
@@ -529,26 +503,26 @@ class GroupManager(BaseManager, ChartMixin):
                 'last_seen': max(event.datetime, group.last_seen),
                 'score': ScoreClause(group),
             }
-            message = kwargs.get('message')
-            if message:
-                extra['message'] = message
+            if event.message and event.message != group.message:
+                extra['message'] = event.message
+            if group.level != event.level:
+                extra['level'] = event.level
 
             if group.status == STATUS_RESOLVED or group.is_over_resolve_age():
                 # Making things atomic
                 is_new = bool(self.filter(
                     id=group.id,
+                    status=STATUS_RESOLVED,
                 ).exclude(
-                    status=STATUS_UNRESOLVED,
                     active_at__gte=date,
                 ).update(active_at=date, status=STATUS_UNRESOLVED))
+
+                transaction.commit_unless_managed(using=group._state.db)
 
                 group.active_at = date
                 group.status = STATUS_UNRESOLVED
 
             group.last_seen = extra['last_seen']
-
-            silence_timedelta = date - group.last_seen
-            silence = silence_timedelta.days * 86400 + silence_timedelta.seconds
 
             app.buffer.incr(self.model, update_kwargs, {
                 'id': group.id,
@@ -556,7 +530,6 @@ class GroupManager(BaseManager, ChartMixin):
         else:
             # TODO: this update should actually happen as part of create
             group.update(score=ScoreClause(group))
-            silence = 0
 
             # We need to commit because the queue can run too fast and hit
             # an issue with the group not existing before the buffers run
@@ -565,7 +538,7 @@ class GroupManager(BaseManager, ChartMixin):
         # Determine if we've sampled enough data to store this event
         if is_new:
             is_sample = False
-        elif not settings.SAMPLE_DATA or group.times_seen % min(count_limit(group.times_seen), time_limit(silence)) == 0:
+        elif not self.should_sample(group, event):
             is_sample = False
         else:
             is_sample = True
@@ -584,20 +557,6 @@ class GroupManager(BaseManager, ChartMixin):
             'date': normalized_datetime,
         })
 
-        if not tags:
-            tags = []
-        else:
-            tags = list(tags)
-
-        tags += [
-            ('logger', event.logger),
-            ('level', event.get_level_display()),
-        ]
-
-        user_ident = event.user_ident
-        if user_ident:
-            self.record_affected_user(group, user_ident, event.data.get('sentry.interfaces.User'))
-
         try:
             self.add_tags(group, tags)
         except Exception, e:
@@ -605,55 +564,18 @@ class GroupManager(BaseManager, ChartMixin):
 
         return group, is_new, is_sample
 
-    def record_affected_user(self, group, user_ident, data=None):
-        from sentry.models import TrackedUser, AffectedUserByGroup
-
-        project = group.project
-        date = group.last_seen
-
-        if data:
-            email = data.get('email')
-        else:
-            email = None
-
-        # TODO: we should be able to chain the affected user update so that tracked
-        # user gets updated serially
-        tuser = TrackedUser.objects.get_or_create(
-            project=project,
-            ident=user_ident,
-            defaults={
-                'email': email,
-                'data': data,
-            }
-        )[0]
-
-        app.buffer.incr(TrackedUser, {
-            'num_events': 1,
-        }, {
-            'id': tuser.id,
-        }, {
-            'last_seen': date,
-            'email': email,
-            'data': data,
-        })
-
-        app.buffer.incr(AffectedUserByGroup, {
-            'times_seen': 1,
-        }, {
-            'group': group,
-            'project': project,
-            'tuser': tuser,
-        }, {
-            'last_seen': date,
-        })
-
     def add_tags(self, group, tags):
-        from sentry.models import FilterValue, GroupTag
+        from sentry.models import TagValue, GroupTag
 
         project = group.project
         date = group.last_seen
 
-        for key, value in itertools.ifilter(lambda x: bool(x[1]), tags):
+        for tag_item in tags:
+            if len(tag_item) == 2:
+                (key, value), data = tag_item, None
+            else:
+                key, value, data = tag_item
+
             if not value:
                 continue
 
@@ -661,7 +583,7 @@ class GroupManager(BaseManager, ChartMixin):
             if len(value) > MAX_TAG_LENGTH:
                 continue
 
-            app.buffer.incr(FilterValue, {
+            app.buffer.incr(TagValue, {
                 'times_seen': 1,
             }, {
                 'project': project,
@@ -669,6 +591,7 @@ class GroupManager(BaseManager, ChartMixin):
                 'value': value,
             }, {
                 'last_seen': date,
+                'data': data,
             })
 
             app.buffer.incr(GroupTag, {
@@ -779,7 +702,8 @@ class RawQuerySet(object):
 
 
 class ProjectManager(BaseManager, ChartMixin):
-    def get_for_user(self, user=None, access=None, hidden=False, team=None):
+    def get_for_user(self, user=None, access=None, hidden=False, team=None,
+                     superuser=True):
         """
         Returns a SortedDict of all projects a user has some level of access to.
         """
@@ -797,27 +721,29 @@ class ProjectManager(BaseManager, ChartMixin):
         if team:
             base_qs = base_qs.filter(team=team)
 
-        if team and user.is_superuser:
+        if team and user.is_superuser and superuser:
             projects = set(base_qs)
         else:
-            if not settings.PUBLIC:
+            projects_qs = base_qs
+            if not settings.SENTRY_PUBLIC:
                 # If the user is authenticated, include their memberships
-                teams = Team.objects.get_for_user(user, access).values()
+                teams = Team.objects.get_for_user(
+                    user, access, access_groups=False).values()
                 if not teams:
-                    return []
+                    projects_qs = self.none()
                 if team and team not in teams:
-                    return []
+                    projects_qs = self.none()
                 elif not team:
-                    base_qs = base_qs.filter(team__in=teams)
+                    projects_qs = projects_qs.filter(team__in=teams)
 
-            projects = set(base_qs)
+            projects = set(projects_qs)
 
             if is_authenticated:
                 projects |= set(base_qs.filter(accessgroup__members=user))
 
         attach_foreignkey(projects, self.model.team)
 
-        return sorted(projects, key=lambda x: x.name)
+        return sorted(projects, key=lambda x: x.name.lower())
 
 
 class MetaManager(BaseManager):
@@ -827,6 +753,17 @@ class MetaManager(BaseManager):
         super(MetaManager, self).__init__(*args, **kwargs)
         task_postrun.connect(self.clear_cache)
         request_finished.connect(self.clear_cache)
+        self.__metadata = {}
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        # we cant serialize weakrefs
+        d.pop('_MetaManager__metadata', None)
+        return d
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__metadata = {}
 
     def get_value(self, key, default=NOTSET):
         result = self.get_all_values()
@@ -836,31 +773,28 @@ class MetaManager(BaseManager):
 
     def unset_value(self, key):
         self.filter(key=key).delete()
-        if not hasattr(self, '_metadata'):
-            return
-        self._metadata.pop(key, None)
+        self.__metadata.pop(key, None)
 
     def set_value(self, key, value):
-        inst, created = self.get_or_create(
+        print key, value
+        inst, _ = self.get_or_create(
             key=key,
             defaults={
                 'value': value,
             }
         )
-        if not created and inst.value != value:
+        if inst.value != value:
             inst.update(value=value)
 
-        if not hasattr(self, '_metadata'):
-            return
-        self._metadata[key] = value
+        self.__metadata[key] = value
 
     def get_all_values(self):
-        if not hasattr(self, '_metadata'):
-            self._metadata = dict((i.key, i.value) for i in self.all())
-        return self._metadata
+        if not hasattr(self, '_MetaManager__metadata'):
+            self.__metadata = dict(self.values_list('key', 'value'))
+        return self.__metadata
 
     def clear_cache(self, **kwargs):
-        self._metadata = {}
+        self.__metadata = {}
 
 
 class InstanceMetaManager(BaseManager):
@@ -871,6 +805,17 @@ class InstanceMetaManager(BaseManager):
         self.field_name = field_name
         task_postrun.connect(self.clear_cache)
         request_finished.connect(self.clear_cache)
+        self.__metadata = {}
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        # we cant serialize weakrefs
+        d.pop('_InstanceMetaManager__metadata', None)
+        return d
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__metadata = {}
 
     def get_value_bulk(self, instances, key):
         return dict(self.filter(**{
@@ -886,11 +831,9 @@ class InstanceMetaManager(BaseManager):
 
     def unset_value(self, instance, key):
         self.filter(**{self.field_name: instance, 'key': key}).delete()
-        if not hasattr(self, '_metadata'):
+        if instance.pk not in self.__metadata:
             return
-        if instance.pk not in self._metadata:
-            return
-        self._metadata[instance.pk].pop(key, None)
+        self.__metadata[instance.pk].pop(key, None)
 
     def set_value(self, instance, key, value):
         inst, created = self.get_or_create(**{
@@ -903,27 +846,28 @@ class InstanceMetaManager(BaseManager):
         if not created and inst.value != value:
             inst.update(value=value)
 
-        if not hasattr(self, '_metadata'):
+        if instance.pk not in self.__metadata:
             return
-        if instance.pk not in self._metadata:
-            return
-        self._metadata[instance.pk][key] = value
+        self.__metadata[instance.pk][key] = value
 
     def get_all_values(self, instance):
-        if not hasattr(self, '_metadata'):
-            self._metadata = {}
-        if instance.pk not in self._metadata:
+        if isinstance(instance, models.Model):
+            instance_id = instance.pk
+        else:
+            instance_id = instance
+
+        if instance_id not in self.__metadata:
             result = dict(
                 (i.key, i.value) for i in
                 self.filter(**{
-                    self.field_name: instance,
+                    self.field_name: instance_id,
                 })
             )
-            self._metadata[instance.pk] = result
-        return self._metadata[instance.pk]
+            self.__metadata[instance_id] = result
+        return self.__metadata.get(instance_id, {})
 
     def clear_cache(self, **kwargs):
-        self._metadata = {}
+        self.__metadata = {}
 
 
 class UserOptionManager(BaseManager):
@@ -933,6 +877,17 @@ class UserOptionManager(BaseManager):
         super(UserOptionManager, self).__init__(*args, **kwargs)
         task_postrun.connect(self.clear_cache)
         request_finished.connect(self.clear_cache)
+        self.__metadata = {}
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        # we cant serialize weakrefs
+        d.pop('_UserOptionManager__metadata', None)
+        return d
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__metadata = {}
 
     def get_value(self, user, project, key, default=NOTSET):
         result = self.get_all_values(user, project)
@@ -948,9 +903,9 @@ class UserOptionManager(BaseManager):
             metakey = (user.pk, project.pk)
         else:
             metakey = (user.pk, None)
-        if metakey not in self._metadata:
+        if metakey not in self.__metadata:
             return
-        self._metadata[metakey].pop(key, None)
+        self.__metadata[metakey].pop(key, None)
 
     def set_value(self, user, project, key, value):
         inst, created = self.get_or_create(
@@ -964,24 +919,20 @@ class UserOptionManager(BaseManager):
         if not created and inst.value != value:
             inst.update(value=value)
 
-        if not hasattr(self, '_metadata'):
-            return
         if project:
             metakey = (user.pk, project.pk)
         else:
             metakey = (user.pk, None)
-        if metakey not in self._metadata:
+        if metakey not in self.__metadata:
             return
-        self._metadata[metakey][key] = value
+        self.__metadata[metakey][key] = value
 
     def get_all_values(self, user, project):
-        if not hasattr(self, '_metadata'):
-            self._metadata = {}
         if project:
             metakey = (user.pk, project.pk)
         else:
             metakey = (user.pk, None)
-        if metakey not in self._metadata:
+        if metakey not in self.__metadata:
             result = dict(
                 (i.key, i.value) for i in
                 self.filter(
@@ -989,143 +940,14 @@ class UserOptionManager(BaseManager):
                     project=project,
                 )
             )
-            self._metadata[metakey] = result
-        return self._metadata[metakey]
+            self.__metadata[metakey] = result
+        return self.__metadata.get(metakey, {})
 
     def clear_cache(self, **kwargs):
-        self._metadata = {}
+        self.__metadata = {}
 
 
-class SearchDocumentManager(BaseManager):
-    # Words which should not be indexed
-    STOP_WORDS = set(['the', 'of', 'to', 'and', 'a', 'in', 'is', 'it', 'you', 'that'])
-
-    # Do not index any words shorter than this
-    MIN_WORD_LENGTH = 3
-
-    # Consider these characters to be punctuation (they will be replaced with spaces prior to word extraction)
-    PUNCTUATION_CHARS = re.compile('[%s]' % re.escape(".,;:!?@$%^&*()-<>[]{}\\|/`~'\""))
-
-    def _tokenize(self, text):
-        """
-        Given a string, returns a list of tokens.
-        """
-        if not text:
-            return []
-
-        text = self.PUNCTUATION_CHARS.sub(' ', text)
-
-        words = [t[:128].lower() for t in text.split() if len(t) >= self.MIN_WORD_LENGTH and t.lower() not in self.STOP_WORDS]
-
-        return words
-
-    def search(self, project, query, sort_by='score', offset=0, limit=100):
-        tokens = self._tokenize(query)
-
-        if sort_by == 'score':
-            order_by = 'SUM(st.times_seen) / sd.total_events DESC'
-        elif sort_by == 'new':
-            order_by = 'sd.date_added DESC'
-        elif sort_by == 'date':
-            order_by = 'sd.date_changed DESC'
-        else:
-            raise ValueError('sort_by: %r' % sort_by)
-
-        if tokens:
-            token_sql = ' st.token IN (%s) AND ' % \
-                ', '.join('%s' for i in range(len(tokens)))
-        else:
-            token_sql = ' '
-
-        sql = """
-            SELECT sd.*,
-                   SUM(st.times_seen) / sd.total_events as score
-            FROM sentry_searchdocument as sd
-            INNER JOIN sentry_searchtoken as st
-                ON st.document_id = sd.id
-            WHERE %s
-                sd.project_id = %s
-            GROUP BY sd.id, sd.group_id, sd.total_events, sd.date_changed, sd.date_added, sd.project_id, sd.status
-            ORDER BY %s
-            LIMIT %d OFFSET %d
-        """ % (
-            token_sql,
-            project.id,
-            order_by,
-            limit,
-            offset,
-        )
-        params = tokens
-
-        return self.raw(sql, params)
-
-    def index(self, event):
-        from sentry.models import SearchToken
-
-        group = event.group
-        document, created = self.get_or_create(
-            project=event.project,
-            group=group,
-            defaults={
-                'status': group.status,
-                'total_events': 1,
-                'date_added': group.first_seen,
-                'date_changed': group.last_seen,
-            }
-        )
-        if not created:
-            app.buffer.incr(self.model, {
-                'total_events': 1,
-            }, {
-                'id': document.id,
-            }, {
-                'date_changed': group.last_seen,
-                'status': group.status,
-            })
-
-            document.total_events += 1
-            document.date_changed = group.last_seen
-            document.status = group.status
-
-        context = defaultdict(list)
-        for interface in event.interfaces.itervalues():
-            for k, v in interface.get_search_context(event).iteritems():
-                context[k].extend(v)
-
-        context['text'].extend([
-            event.message,
-            event.logger,
-            event.server_name,
-            event.culprit,
-        ])
-
-        token_counts = defaultdict(lambda: defaultdict(int))
-        for field, values in context.iteritems():
-            field = field.lower()
-            if field == 'text':
-                # we only tokenize the base text field
-                values = itertools.chain(*[self._tokenize(force_unicode(v)) for v in values])
-            else:
-                values = [v.lower() for v in values]
-            for value in values:
-                if not value:
-                    continue
-                token_counts[field][value] += 1
-
-        for field, tokens in token_counts.iteritems():
-            for token, count in tokens.iteritems():
-                app.buffer.incr(SearchToken, {
-                    'times_seen': count,
-                }, {
-                    'document': document,
-                    'token': token,
-                    'field': field,
-                })
-
-        return document
-
-
-class FilterKeyManager(BaseManager):
+class TagKeyManager(BaseManager):
     def _get_cache_key(self, project_id):
         return 'filterkey:all:%s' % project_id
 
@@ -1140,34 +962,55 @@ class FilterKeyManager(BaseManager):
 
 
 class TeamManager(BaseManager):
-    def get_for_user(self, user, access=None):
+    def get_for_user(self, user, access=None, access_groups=True, with_projects=False):
         """
         Returns a SortedDict of all teams a user has some level of access to.
 
         Each <Team> returned has a ``membership`` attribute which holds the
         <TeamMember> instance.
         """
-        from sentry.models import TeamMember
+        from sentry.models import TeamMember, AccessGroup, Project
 
         results = SortedDict()
 
         if not user.is_authenticated():
             return results
 
-        if settings.PUBLIC and access is None:
-            for team in self.order_by('name').iterator():
+        if settings.SENTRY_PUBLIC and access is None:
+            for team in sorted(self.iterator(), key=lambda x: x.name.lower()):
                 results[team.slug] = team
         else:
+            all_teams = set()
+
             qs = TeamMember.objects.filter(
                 user=user,
-                is_active=True,
             ).select_related('team')
             if access is not None:
                 qs = qs.filter(type__lte=access)
 
-            for tm in sorted(qs, key=lambda x: x.team.name):
-                team = tm.team
-                team.membership = tm
+            for tm in qs:
+                all_teams.add(tm.team)
+
+            if access_groups:
+                qs = AccessGroup.objects.filter(
+                    members=user,
+                ).select_related('team')
+                if access is not None:
+                    qs = qs.filter(type__lte=access)
+
+                for group in qs:
+                    all_teams.add(group.team)
+
+            for team in sorted(all_teams, key=lambda x: x.name.lower()):
                 results[team.slug] = team
+
+        if with_projects:
+            # these kinds of queries make people sad :(
+            new_results = SortedDict()
+            for team in results.itervalues():
+                project_list = list(Project.objects.get_for_user(
+                    user, team=team))
+                new_results[team.slug] = (team, project_list)
+            results = new_results
 
         return results

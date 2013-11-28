@@ -17,10 +17,9 @@ class Command(BaseCommand):
     )
 
     def handle(self, **options):
-        from django.contrib.auth.models import User
         from django.template.defaultfilters import slugify
-        from sentry.models import Project, Team, ProjectKey
-        from sentry.utils.models import update
+        from sentry.models import Project, Team, ProjectKey, User
+        from sentry.db.models import update
 
         if options.get('owner'):
             owner = User.objects.get(username__iexact=options.get('owner'))

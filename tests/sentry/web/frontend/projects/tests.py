@@ -4,62 +4,14 @@ from __future__ import absolute_import
 
 import mock
 import logging
-from mock_django.managers import ManagerMock
 
 from django.core.urlresolvers import reverse
 
-from sentry.constants import MEMBER_OWNER
-from sentry.models import Project, ProjectKey
+from sentry.constants import STATUS_HIDDEN
+from sentry.models import Project, ProjectKey, ProjectOption, TagKey
 from sentry.testutils import TestCase, fixture, before
 
 logger = logging.getLogger(__name__)
-
-
-class NewProjectTest(TestCase):
-    @fixture
-    def path(self):
-        return reverse('sentry-new-team-project', args=[self.team.slug])
-
-    def test_missing_permission(self):
-        resp = self.client.get(self.path)
-        assert resp.status_code == 302
-
-    def test_does_load(self):
-        self.login_as(self.user)
-
-        resp = self.client.get(self.path)
-        self.assertEquals(resp.status_code, 200)
-        self.assertTemplateUsed('sentry/projects/new.html')
-
-    def test_missing_name(self):
-        self.login_as(self.user)
-
-        resp = self.client.post(self.path)
-        self.assertEquals(resp.status_code, 200)
-
-    def test_valid_params(self):
-        self.login_as(self.user)
-
-        resp = self.client.post(self.path, {
-            'name': 'Test Project',
-            'slug': 'test',
-            'platform': 'python',
-        })
-        self.assertNotEquals(resp.status_code, 200)
-
-        project = Project.objects.filter(name='Test Project')
-        self.assertTrue(project.exists())
-        project = project.get()
-
-        self.assertEquals(project.owner, self.user)
-        self.assertNotEquals(project.team, None)
-
-        member_set = list(project.team.member_set.all())
-
-        self.assertEquals(len(member_set), 1)
-        member = member_set[0]
-        self.assertEquals(member.user, self.user)
-        self.assertEquals(member.type, MEMBER_OWNER)
 
 
 class ManageProjectKeysTest(TestCase):
@@ -94,7 +46,7 @@ class NewProjectKeyTest(TestCase):
 
         resp = self.client.get(self.path)
         assert resp.status_code == 302
-        create.assert_called_once_with(
+        create.assert_any_call(
             project=self.project, user_added=self.user
         )
 
@@ -137,16 +89,9 @@ class DashboardTest(TestCase):
 
         can_create_projects.return_value = True
 
-        manager = ManagerMock(Project.objects)
-
-        with mock.patch('sentry.models.Project.objects', manager):
-            resp = self.client.get(self.path)
+        resp = self.client.get(self.path)
 
         can_create_projects.assert_called_once_with(self.user, team=self.team)
-
-        manager.assert_chain_calls(
-            mock.call.filter(team=self.team),
-        )
 
         assert resp.status_code == 302
         assert resp['Location'] == 'http://testserver' + reverse('sentry-new-project', args=[self.team.slug])
@@ -157,16 +102,9 @@ class DashboardTest(TestCase):
 
         can_create_projects.return_value = False
 
-        manager = ManagerMock(Project.objects)
-
-        with mock.patch('sentry.models.Project.objects', manager):
-            resp = self.client.get(self.path)
+        resp = self.client.get(self.path)
 
         can_create_projects.assert_called_once_with(self.user, team=self.team)
-
-        manager.assert_chain_calls(
-            mock.call.filter(team=self.team),
-        )
 
         assert resp.status_code == 200
         self.assertTemplateUsed(resp, 'sentry/dashboard.html')
@@ -175,22 +113,17 @@ class DashboardTest(TestCase):
     def test_does_not_redirect_if_has_projects(self, can_create_projects):
         self.login_as(self.user)
 
-        manager = ManagerMock(Project.objects, self.project)
+        # HACK: force creation
+        self.project
 
-        with mock.patch('sentry.models.Project.objects', manager):
-            resp = self.client.get(self.path)
+        resp = self.client.get(self.path)
 
         assert not can_create_projects.called
-
-        manager.assert_chain_calls(
-            mock.call.filter(team=self.team),
-        )
 
         assert resp.status_code == 200
         self.assertTemplateUsed(resp, 'sentry/dashboard.html')
         assert resp.context['team'] == self.team
         assert resp.context['project_list'] == [self.project]
-        assert resp.context['SECTION'] == 'events'
 
 
 class GetStartedTest(TestCase):
@@ -209,5 +142,78 @@ class GetStartedTest(TestCase):
         self.assertTemplateUsed(resp, 'sentry/get_started.html')
         assert resp.context['project'] == self.project
         assert resp.context['team'] == self.team
-        assert resp.context['SECTION'] == 'team'
-        assert resp.context['SUBSECTION'] == 'projects'
+
+
+class RemoveProjectTest(TestCase):
+    @fixture
+    def path(self):
+        return reverse('sentry-remove-project', args=[self.team.slug, self.project.id])
+
+    def test_requires_authentication(self):
+        self.assertRequiresAuthentication(self.path, 'POST')
+
+    def test_renders_template_with_get(self):
+        self.login_as(self.user)
+
+        resp = self.client.get(self.path)
+        assert resp.status_code == 200
+        self.assertTemplateUsed(resp, 'sentry/projects/remove.html')
+        assert resp.context['team'] == self.team
+        assert resp.context['project'] == self.project
+
+    @mock.patch('sentry.web.frontend.projects.remove.delete_project')
+    def test_deletion_flow(self, delete_project):
+        self.login_as(self.user)
+
+        # missing password
+        resp = self.client.post(self.path, {'project': self.project.id})
+        assert resp.status_code == 200
+        assert 'password' in resp.context['form'].errors
+
+        # set password to empty value so it doesnt require check
+        self.user.password = ''
+        self.user.save()
+
+        resp = self.client.post(self.path, {'project': self.project.id})
+        assert resp.status_code == 302
+        delete_project.delay.assert_called_once_with(
+            object_id=self.project.id)
+        assert Project.objects.get(id=self.project.id).status == STATUS_HIDDEN
+
+
+class ManageProjectTagsTest(TestCase):
+    @fixture
+    def path(self):
+        return reverse('sentry-manage-project-tags', args=[self.team.slug, self.project.id])
+
+    def test_requires_authentication(self):
+        self.assertRequiresAuthentication(self.path)
+
+    def test_simple(self):
+        TagKey.objects.create(project=self.project, key='site')
+        TagKey.objects.create(project=self.project, key='url')
+        TagKey.objects.create(project=self.project, key='os')
+
+        self.login_as(self.user)
+
+        resp = self.client.get(self.path)
+        assert resp.status_code == 200
+        self.assertTemplateUsed('sentry/projects/manage_tags.html')
+        assert resp.context['team'] == self.team
+        assert resp.context['project'] == self.project
+        tag_list = resp.context['tag_list']
+        assert 'site' in tag_list
+        assert 'url' in tag_list
+        assert 'os' in tag_list
+
+        resp = self.client.post(self.path, {
+            'filters': ['site', 'url'],
+            'annotations': ['os'],
+        })
+        assert resp.status_code == 302
+        enabled_filters = ProjectOption.objects.get_value(
+            self.project, 'tags')
+        assert sorted(enabled_filters) == ['site', 'url']
+        enabled_annotations = ProjectOption.objects.get_value(
+            self.project, 'annotations')
+        assert enabled_annotations == ['os']

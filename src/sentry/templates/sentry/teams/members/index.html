@@ -1,15 +1,8 @@
 {% extends "sentry/teams/manage.html" %}
 
-{% load url from future %}
 {% load i18n %}
 {% load sentry_helpers %}
 {% load sentry_permissions %}
-
-{% block breadcrumb %}
-    {{ block.super }}
-    <li class="divider"></li>
-    <li><a href="{% url 'sentry-manage-team-members' team.slug %}">{% trans "Members" %}</a></li>
-{% endblock %}
 
 {% block bodyclass %} with-sidebar{% endblock %}
 
@@ -30,7 +23,7 @@
         <colgroup>
             <col/>
             <col width="100px"/>
-            <col width="180px"/>
+            <col width="90px"/>
         </colgroup>
         <thead>
             <tr>
@@ -41,34 +34,33 @@
         </thead>
         <tbody>
             {% for member, user in member_list %}
-                <tr>
-                    <td>
-                        <a href="{% url 'sentry-edit-team-member' team.slug member.pk %}">{% if user.first_name %}{{ user.first_name }} &mdash; {% endif %}{{ user.username }}</a><br>
-                        {{ user.email }}
-                    </td>
-                    <td style="text-align:center;">
-                        {% if user == team.owner %}
+                {% if user == team.owner %}
+                    <tr>
+                        <td>
+                            {% if user.first_name %}{{ user.first_name }} &mdash; {% endif %}{{ user.username }}</a><br>
+                            {{ user.email }}
+                        </td>
+                        <td style="text-align:center;">
                             {% trans "Owner" %}
-                        {% else %}
-                            {{ member.get_type_display }}
-                        {% endif %}
-                    </td>
-                    {% if user == team.owner %}
+                        </td>
                         <td style="text-align:center;">
                             <em>{% trans "unavailable for owner" %}</em>
                         </td>
-                    {% else %}
+                    </tr>
+                {% else %}
+                    <tr>
+                        <td>
+                            <a href="{% url 'sentry-edit-team-member' team.slug member.pk %}">{% if user.first_name %}{{ user.first_name }} &mdash; {% endif %}{{ user.username }}</a><br>
+                            {{ user.email }}
+                        </td>
+                        <td style="text-align:center;">
+                            {{ member.get_type_display }}
+                        </td>
                         <td style="text-align:center;">
                             <a href="{% url 'sentry-remove-team-member' team.slug member.pk %}" class="btn btn-danger btn-small">{% trans "Remove" %}</a>
-
-                            {% if member.is_active %}
-                                <a href="{% url 'sentry-suspend-team-member' team.slug member.pk %}" class="btn btn-small">{% trans "Suspend" %}</a>
-                            {% else %}
-                                <a href="{% url 'sentry-restore-team-member' team.slug member.pk %}" class="btn btn-small">{% trans "Restore" %}</a>
-                            {% endif %}
                         </td>
-                    {% endif %}
-                </tr>
+                    </tr>
+                {% endif %}
             {% endfor %}
         </tbody>
     </table>

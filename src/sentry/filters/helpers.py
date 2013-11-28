@@ -13,10 +13,11 @@ __all__ = ('get_filters',)
 
 import logging
 
-from django.utils.translation import ugettext_lazy as _
-from sentry.conf import settings
+from django.conf import settings
+from sentry.constants import TAG_LABELS
 from sentry.filters.base import TagFilter
 from sentry.plugins import plugins
+from sentry.utils.safe import safe_execute
 
 
 FILTER_CACHE = {}
@@ -27,7 +28,7 @@ def get_filters(model=None, project=None):
     filter_list = []
 
     # Add builtins (specified with the FILTERS setting)
-    for class_path in settings.FILTERS:
+    for class_path in settings.SENTRY_FILTERS:
         if class_path not in FILTER_CACHE:
             module_name, class_name = class_path.rsplit('.', 1)
             try:
@@ -46,23 +47,20 @@ def get_filters(model=None, project=None):
                 # Generate a new filter class because we are lazy and do
                 # not want to rewrite code
                 class new(TagFilter):
-                    label = _(tag.replace('_', ' ').title())
+                    label = TAG_LABELS.get(tag) or tag.replace('_', ' ').title()
                     column = tag
-                new.__name__ = '__%sGeneratedFilter' % str(tag)
+                new.__name__ = '__%sGeneratedFilter' % tag.encode('utf8')
                 TAG_FILTER_CACHE[tag] = new
             filter_list.append(TAG_FILTER_CACHE[tag])
 
     # Add plugin-provided filters
-    for plugin in plugins.all():
-        if not plugin.is_enabled(project):
-            continue
-
-        for filter_cls in plugin.get_filters(project):
-            if filter_cls not in filter_list:
-                filter_list.append(filter_cls)
+    for plugin in plugins.for_project(project):
+        results = safe_execute(plugin.get_filters, project)
+        if results:
+            for filter_cls in results:
+                if filter_cls not in filter_list:
+                    filter_list.append(filter_cls)
 
     # yield all filters which support ``model``
     for filter_cls in filter_list:
-        if model and model not in filter_cls.types:
-            continue
         yield filter_cls

@@ -8,32 +8,23 @@ sentry.web.frontend.projects
 from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect
 
-from sentry.constants import (MEMBER_OWNER, PLATFORM_LIST, PLATFORM_TITLES,
-    PLATFORM_ROOTS)
+from sentry.constants import (
+    PLATFORM_LIST, PLATFORM_TITLES, PLATFORM_ROOTS)
 from sentry.models import ProjectKey
 from sentry.web.decorators import has_access
-from sentry.web.helpers import render_to_response, render_to_string
-
-
-def can_see_global_keys(user, project):
-    if user.is_superuser:
-        return True
-    if not project.team:
-        return False
-    if not project.team.member_set.filter(user=user, type=MEMBER_OWNER).exists():
-        return False
-    return True
+from sentry.web.helpers import render_to_response, render_to_string, get_raven_js_url
 
 
 def get_key_context(user, project):
     try:
         key = ProjectKey.objects.get(user=user, project=project)
     except ProjectKey.DoesNotExist:
-        if can_see_global_keys(user, project):
-            key_list = list(ProjectKey.objects.filter(project=project, user__isnull=True)[0:2])
-        if len(key_list) == 1:
-            key = key_list[0]
-        else:
+        try:
+            key = ProjectKey.objects.filter(
+                project=project,
+                user__isnull=True,
+            )[0]
+        except IndexError:
             key = None
 
     if key is None:
@@ -47,6 +38,7 @@ def get_key_context(user, project):
         'key': key,
         'dsn': dsn,
         'dsn_public': dsn_public,
+        'raven_js_url': get_raven_js_url(),
     }
 
 

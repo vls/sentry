@@ -1,28 +1,21 @@
 {% extends "sentry/projects/manage.html" %}
 
-{% load url from future %}
 {% load i18n %}
 {% load sentry_helpers %}
 {% load sentry_plugins %}
 
-{% block title %}{% trans "Manage Plugins" %} | {{ block.super }}{% endblock %}
-
-{% block breadcrumb %}
-    {{ block.super }}
-    <li class="divider"></li>
-    <li><a href="{% url 'sentry-manage-project-plugins' project.team.slug project.slug %}">{% trans "Plugins" %}</a></li>
-{% endblock %}
+{% block title %}{% trans "Manage Integrations" %} | {{ block.super }}{% endblock %}
 
 {% block inner %}
     <div class="page-header">
-        <h2>{% trans "Manage Plugins" %}</h2>
+        <h2>{% trans "Manage Integrations" %}</h2>
     </div>
     <form method="POST">
         {% csrf_token %}
         <table class="table table-striped">
             <thead>
                 <tr>
-                    <th>{% trans "Plugin" %}</th>
+                    <th>{% trans "Integration" %}</th>
                     <th style="width:100px;text-align:center;">{% trans "Version" %}</th>
                     <th style="width:100px;text-align:center;">{% trans "Enabled" %}</th>
                 </tr>
@@ -45,7 +38,7 @@
                             {% if plugin.version %}{{ plugin.version }}{% else %}<em>{% trans "n/a" %}</em>{% endif %}
                         </td>
                         <td style="text-align:center;">
-                            {% if plugin.can_enable_for_projects %}
+                            {% if plugin.can_disable and plugin.can_enable_for_projects %}
                                 <input type="checkbox" name="plugin" value="{{ plugin.slug }}"{% if is_enabled %} checked="checked"{% endif %}/>
                             {% else %}
                                 <em>{% trans "n/a" %}</em>

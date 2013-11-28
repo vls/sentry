@@ -1,4 +1,4 @@
-(function(app, Backbone, jQuery, _){
+(function(window, app, Backbone, jQuery, _, moment){
     "use strict";
 
     var $ = jQuery;
@@ -9,16 +9,29 @@
         template: _.template(app.templates.group),
 
         initialize: function(){
-            _.bindAll(this);
-            this.model.on('change:count', this.updateCount);
-            this.model.on('change:lastSeen', this.updateLastSeen);
-            this.model.on('change:isBookmarked', this.render);
-            this.model.on('change:isResolved', this.updateResolved);
-            this.model.on('change:historicalData', this.renderSparkline);
+            Backbone.View.prototype.initialize.apply(this, arguments);
+
+            _.bindAll(this, 'updateCount', 'updateAllAnnotations', 'updateAnnotation', 'updateLastSeen',
+                'updateResolved', 'updateHasSeen', 'renderSparkline', 'updateBookmarked',
+                'render');
+
+            this.model.on({
+                'change:count': this.updateCount,
+                'change:annotations': this.updateAllAnnotations,
+                'change:lastSeen': this.updateLastSeen,
+                'change:isBookmarked': this.updateBookmarked,
+                'change:isResolved': this.updateResolved,
+                'change:hasSeen': this.updateHasSeen,
+                'change:historicalData': this.renderSparkline
+            }, this);
         },
 
         render: function(){
             var data = this.model.toJSON();
+            data.projectUrl = app.config.urlPrefix + '/' + app.config.teamId +
+                '/' + data.project.slug + '/';
+            data.loggerUrl = data.projectUrl + '?logger=' + data.logger;
+
             this.$el.html(this.template(data));
             this.$el.attr('data-id', this.model.id);
             this.$el.addClass(this.getLevelClassName());
@@ -34,8 +47,19 @@
                 e.preventDefault();
                 this.bookmark();
             }, this));
+            this.updateLastSeen();
             this.renderSparkline();
             this.updateResolved();
+            this.updateHasSeen();
+            this.updateBookmarked();
+        },
+
+        updateBookmarked: function(){
+            if (this.model.get('isBookmarked')) {
+                this.$el.find('a[data-action=bookmark]').addClass('checked');
+            } else {
+                this.$el.find('a[data-action=bookmark]').removeClass('checked');
+            }
         },
 
         updateResolved: function(){
@@ -43,6 +67,14 @@
                 this.$el.addClass('resolved');
             } else {
                 this.$el.removeClass('resolved');
+            }
+        },
+
+        updateHasSeen: function(){
+            if (this.model.get('hasSeen')) {
+                this.$el.addClass('seen');
+            } else {
+                this.$el.removeClass('seen');
             }
         },
 
@@ -62,6 +94,7 @@
                 type: 'post',
                 dataType: 'json',
                 success: _.bind(function(response) {
+                    this.model.set('version', response.version);
                     this.model.set('isResolved', true);
                 }, this)
             });
@@ -73,6 +106,7 @@
                 type: 'post',
                 dataType: 'json',
                 success: _.bind(function(response) {
+                    this.model.set('version', response.version);
                     this.model.set('isResolved', false);
                 }, this)
             });
@@ -85,7 +119,7 @@
         },
 
         getUnresolveUrl: function(){
-            return app.config.urlPrefix + '/api/' + app.config.teamId + '/' + 
+            return app.config.urlPrefix + '/api/' + app.config.teamId + '/' +
                     app.config.projectId + '/group/' + this.model.get('id') +
                     '/set/unresolved/';
         },
@@ -103,6 +137,7 @@
                     gid: this.model.get('id')
                 },
                 success: _.bind(function(response){
+                    this.model.set('version', response.version);
                     this.model.set('isBookmarked', response.isBookmarked);
                 }, this)
             });
@@ -113,9 +148,11 @@
         },
 
         updateLastSeen: function(){
+            var dt = moment(this.model.get('lastSeen'));
             this.$el.find('.last-seen')
-                .text(app.utils.prettyDate(this.model.get('lastSeen')))
-                .attr('title', this.model.get('lastSeen'));
+                .text(dt.fromNow())
+                .data('datetime', this.model.get('lastSeen'))
+                .attr('title', dt.format('llll'));
         },
 
         updateCount: function(){
@@ -155,6 +192,55 @@
                 top: 0,
                 opacity: 1
             }, 'fast');
+        },
+
+        updateAnnotation: function(annotation){
+            var value = annotation.count;
+            if (value === null)
+                return;
+            var new_count = app.utils.formatNumber(value);
+            var counter = this.$el.find('.annotation[data-tag="' + annotation.label + '"]');
+            var digit = counter.find('span');
+
+            if (digit.is(':animated'))
+                return false;
+
+            if (counter.data('count') == new_count) {
+                // We are already showing this number
+                return false;
+            }
+
+            counter.data('count', new_count);
+
+            var replacement = $('<span></span>', {
+                css: {
+                    top: '-2.1em',
+                    opacity: 0
+                },
+                text: new_count
+            });
+
+            // The .static class is added when the animation
+            // completes. This makes it run smoother.
+
+            digit.before(replacement).animate({
+                top: '2.5em',
+                opacity: 0
+            }, 'fast', function(){
+                digit.remove();
+            });
+
+            replacement.delay(100).animate({
+                top: 0,
+                opacity: 1
+            }, 'fast');
+        },
+
+        updateAllAnnotations: function(){
+            var self = this;
+            $.each(this.model.get('annotations'), function(index, annotation){
+                self.updateAnnotation(annotation);
+            });
         }
 
     });
@@ -166,13 +252,17 @@
         model: app.models.Group,
 
         defaults: {
-            maxItems: 50
+            maxItems: 50,
+            view: Backbone.View
         },
 
         initialize: function(data){
+            if (_.isUndefined(data))
+                data = {};
+
             var members = data.members;
 
-            _.bindAll(this);
+            Backbone.View.prototype.initialize.apply(this, arguments);
 
             this.options = $.extend({}, this.defaults, this.options, data);
 
@@ -184,10 +274,14 @@
             if (this.options.className)
                 this.$parent.addClass(this.options.className);
 
-            this.collection = new app.ScoredList();
-            this.collection.on('add', this.renderMemberInContainer);
-            this.collection.on('remove', this.unrenderMember);
-            this.collection.on('reset', this.reSortMembers);
+            _.bindAll(this, 'renderMemberInContainer', 'unrenderMember', 'reSortMembers');
+
+            this.collection = new app.ScoredList([], {
+                model: data.model
+            });
+            this.collection.on('add', this.renderMemberInContainer, this);
+            this.collection.on('remove', this.unrenderMember, this);
+            this.collection.on('reset', this.reSortMembers, this);
 
             delete data.members;
 
@@ -221,22 +315,18 @@
         },
 
         addMember: function(member){
-            if (member.get === undefined) {
-                member = new this.model(member);
-            }
             if (!this.hasMember(member)) {
-                if (this.collection.models.length >= (this.options.maxItems - 1))
+                if (this.collection.length >= this.options.maxItems) {
                     // bail early if the score is too low
-                    if (member.get('score') < this.collection.last().get('score'))
+                    if (member.score < this.collection.last().get('score'))
                         return;
 
                     // make sure we limit the number shown
-                    while (this.collection.models.length >= this.options.maxItems)
+                    while (this.collection.length >= this.options.maxItems)
                         this.collection.pop();
-                this.collection.add(member);
-            } else {
-                this.updateMember(member);
+                }
             }
+            this.collection.add(member, {merge: true});
         },
 
         reSortMembers: function(){
@@ -250,16 +340,14 @@
                 options = {};
 
             var existing = this.collection.get(member.id);
-            for (var key in member.attributes) {
-                if (existing.get(key) != member.get(key)) {
-                    existing.set(key, member.get(key));
-                }
-            }
+            if (existing.get('version') > member.get('version'))
+                return;
 
-            if (options.sort !== false) {
-                // score changed, resort
-                this.collection.sort();
-            }
+            this.collection.add(member, {
+                merge: true,
+                sort: options.sort !== false ? true : false
+            });
+
         },
 
         hasMember: function(member){
@@ -308,7 +396,7 @@
         },
 
         renderMember: function(member){
-            var view = new app.GroupView({
+            var view = new this.options.view({
                 model: member,
                 id: this.id + member.id
             });
@@ -317,7 +405,7 @@
         },
 
         unrenderMember: function(member){
-            $('#' + this.id + member.id).remove();
+            this.$parent.find('#' + this.id + member.id).remove();
             if (!this.$parent.find('li').length)
                 this.setEmpty();
         }
@@ -340,14 +428,19 @@
                 data = {};
 
             data.model = app.models.Group;
-            
+            data.view = app.GroupView;
+
             app.OrderedElementsView.prototype.initialize.call(this, data);
 
             this.options = $.extend({}, this.defaults, this.options, data);
 
-            this.queue = new app.ScoredList();
+            this.queue = new app.ScoredList([], {
+                model: data.model
+            });
 
             this.cursor = null;
+
+            _.bindAll(this, 'poll', 'pollSuccess', 'pollFailure', 'tick');
 
             this.poll();
 
@@ -368,6 +461,22 @@
             }
         },
 
+        pollSuccess: function(groups){
+            if (!groups.length)
+                return window.setTimeout(this.poll, this.options.pollTime * 5);
+
+            this.cursor = groups[groups.length - 1].score;
+
+            this.queue.add(groups, {merge: true});
+
+            window.setTimeout(this.poll, this.options.pollTime);
+        },
+
+        pollFailure: function(jqXHR, textStatus, errorThrown){
+            // if an error happened lets give the server a bit of time before we poll again
+            window.setTimeout(this.poll, this.options.pollTime * 10);
+        },
+
         poll: function(){
             var data;
 
@@ -379,56 +488,14 @@
 
             $.ajax({
                 url: this.options.pollUrl,
-                type: 'get',
+                type: 'GET',
                 dataType: 'json',
                 data: data,
-                success: _.bind(function(groups){
-                    var i, data, obj;
-
-                    if (!groups.length)
-                        return setTimeout(this.poll, this.options.pollTime * 5);
-
-                    this.cursor = groups[groups.length - 1].score || undefined;
-
-                    for (i=0; (data = groups[i]); i+=1) {
-                        obj = this.queue.get(data.id);
-                        if (!_.isUndefined(obj)) {
-                            // TODO: this code is shared in updateMember above
-                            obj.set('count', data.count);
-                            obj.set('score', data.score);
-                            this.queue.sort();
-                        } else {
-                            this.queue.add(data);
-                        }
-                    }
-
-                    window.setTimeout(this.poll, this.options.pollTime);
-                }, this),
-                error: _.bind(function(){
-                    // if an error happened lets give the server a bit of time before we poll again
-                    window.setTimeout(this.poll, this.options.pollTime * 10);
-                }, this)
+                success: this.pollSuccess,
+                error: this.pollFailure
             });
         }
 
     });
 
-    app.UserListView = app.OrderedElementsView.extend({
-
-        defaults: {
-        },
-
-        initialize: function(data){
-            if (_.isUndefined(data))
-                data = {};
-
-            data.model = app.User;
-            
-            app.OrderedElementsView.prototype.initialize.call(this, data);
-
-            this.options = $.extend({}, this.defaults, this.options, data);
-        }
-
-    });
-
-}(app, Backbone, jQuery, _));
+}(window, app, Backbone, jQuery, _, moment));

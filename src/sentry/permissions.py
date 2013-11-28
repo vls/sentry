@@ -6,10 +6,27 @@ sentry.permissions
 :license: BSD, see LICENSE for more details.
 """
 from functools import wraps
-from sentry.conf import settings
+from django.conf import settings
 from sentry.constants import MEMBER_OWNER
 from sentry.plugins import plugins
 from sentry.utils.cache import cached_for_request
+
+
+class Permission(object):
+    def __init__(self, name, label):
+        self.name = name
+        self.label = label
+
+    def __unicode__(self):
+        return self.name
+
+    def __eq__(self, other):
+        return unicode(self) == unicode(other)
+
+
+class Permissions(object):
+    ADD_PROJECT = Permission('add_project', 'create new projects')
+    ADD_TEAM = Permission('add_team', 'create new teams')
 
 
 def perm_override(perm):
@@ -49,7 +66,7 @@ def can_create_projects(user, team=None):
 
     result = plugins.first('has_perm', user, 'add_project', team)
     if result is None:
-        result = settings.ALLOW_PROJECT_CREATION
+        result = settings.SENTRY_ALLOW_PROJECT_CREATION
 
     if result is False:
         return result
@@ -67,7 +84,7 @@ def can_create_teams(user):
     """
     result = plugins.first('has_perm', user, 'add_team')
     if result is None:
-        result = settings.ALLOW_TEAM_CREATION
+        result = settings.SENTRY_ALLOW_TEAM_CREATION
 
     if result is False:
         return result
@@ -84,7 +101,7 @@ def can_set_public_projects(user):
     """
     result = plugins.first('has_perm', user, 'set_project_public')
     if result is None:
-        result = settings.ALLOW_PUBLIC_PROJECTS
+        result = settings.SENTRY_ALLOW_PUBLIC_PROJECTS
 
     if result is False:
         return result

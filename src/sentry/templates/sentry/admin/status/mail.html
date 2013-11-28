@@ -1,18 +1,12 @@
-{% extends "sentry/admin/base.html" %}
+{% extends "sentry/bases/admin.html" %}
 
 {% block admin-nav-queue %} class="active"{% endblock %}
 
-{% load url from future %}
 {% load crispy_forms_tags %}
 {% load i18n %}
 {% load sentry_helpers %}
 
 {% block title %}{% trans "Mail Configuration" %} | {{ block.super }}{% endblock %}
-
-{% block breadcrumb %}
-    <li class="divider"></li>
-    <li><a href="{% url 'sentry-admin-mail-status' %}">{% trans "Mail Configuration" %}</a></li>
-{% endblock %}
 
 {% block inner %}
     <div class="page-header">
@@ -23,6 +17,10 @@
             <col style="width:120px">
         </colgroup>
         <tbody>
+            <tr>
+                <th>{% trans "From Address" %}</th>
+                <td class="code">{{ SERVER_EMAIL }}</td>
+            </tr>
             <tr>
                 <th>{% trans "Host" %}</th>
                 <td class="code">{{ EMAIL_HOST }}:{{ EMAIL_PORT }}</td>
@@ -52,7 +50,7 @@
         {{ form|as_crispy_errors }}
 
         {% for field in form %}
-            {% include "sentry/partial/_form_field.html" %}
+            {{ field|as_crispy_field }}
         {% endfor %}
 
         <input type="submit" class="btn" value="{% blocktrans with request.user.email as email %}Send a test email to {{ email }}{% endblocktrans %}">

@@ -9,7 +9,7 @@ sentry.tasks.cleanup
 from celery.task import task
 
 
-@task(ignore_result=True)
+@task(name='sentry.tasks.cleanup.cleanup', queue='cleanup')
 def cleanup(days=30, project=None, chunk_size=1000, **kwargs):
     """
     Deletes a portion of the trailing data in Sentry based on
@@ -23,10 +23,13 @@ def cleanup(days=30, project=None, chunk_size=1000, **kwargs):
 
     from django.utils import timezone
 
-    # TODO: FilterKey and GroupTagKey need cleaned up
-    from sentry.models import (Group, Event, GroupCountByMinute,
-        GroupTag, FilterValue, ProjectCountByMinute, Alert,
-        SearchDocument, Activity, AffectedUserByGroup, LostPasswordHash)
+    from sentry import app
+    # TODO: TagKey and GroupTagKey need cleaned up
+    from sentry.models import (
+        Group, Event, GroupCountByMinute, EventMapping,
+        GroupTag, TagValue, ProjectCountByMinute, Alert,
+        Activity, LostPasswordHash)
+    from sentry.search.django.models import SearchDocument
 
     GENERIC_DELETES = (
         (SearchDocument, 'date_changed'),
@@ -35,10 +38,9 @@ def cleanup(days=30, project=None, chunk_size=1000, **kwargs):
         (GroupTag, 'last_seen'),
         (Event, 'datetime'),
         (Activity, 'datetime'),
-        (AffectedUserByGroup, 'last_seen'),
-        (FilterValue, 'last_seen'),
+        (TagValue, 'last_seen'),
         (Alert, 'datetime'),
-
+        (EventMapping, 'date_added'),
         # Group should probably be last
         (Group, 'last_seen'),
     )
@@ -46,6 +48,18 @@ def cleanup(days=30, project=None, chunk_size=1000, **kwargs):
     log = cleanup.get_logger()
 
     ts = timezone.now() - datetime.timedelta(days=days)
+
+    log.info("Removing expired values for %r", LostPasswordHash)
+    LostPasswordHash.objects.filter(
+        date_added__lte=timezone.now() - datetime.timedelta(days=1)
+    ).delete()
+
+    # TODO: we should move this into individual backends
+    log.info("Removing old Node values")
+    try:
+        app.nodestore.cleanup(ts)
+    except NotImplementedError:
+        log.warning("Node backend does not support cleanup operation")
 
     # Remove types which can easily be bound to project + date
     for model, date_col in GENERIC_DELETES:
@@ -58,8 +72,3 @@ def cleanup(days=30, project=None, chunk_size=1000, **kwargs):
             for obj in list(qs[:chunk_size]):
                 log.info("Removing %r", obj)
                 obj.delete()
-
-    log.info("Removing expired values for %r", LostPasswordHash)
-    LostPasswordHash.objects.filter(
-        date_added__lte=timezone.now() - datetime.timedelta(days=1)
-    ).delete()

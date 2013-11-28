@@ -6,24 +6,34 @@ sentry.tasks.fetch_source
 :license: BSD, see LICENSE for more details.
 """
 
-import zlib
+import itertools
+import logging
 import hashlib
+import re
 import urllib2
+import zlib
+import base64
 from collections import namedtuple
 from urlparse import urljoin
 
-from celery.task import task
 from django.utils.simplejson import JSONDecodeError
+
+from sentry.constants import SOURCE_FETCH_TIMEOUT
 from sentry.utils.cache import cache
 from sentry.utils.sourcemaps import sourcemap_to_index, find_source
 
-BAD_SOURCE = -1
 
+BAD_SOURCE = -1
 # number of surrounding lines (on each side) to fetch
 LINES_OF_CONTEXT = 5
-
+CHARSET_RE = re.compile(r'charset=(\S+)')
+DEFAULT_ENCODING = 'utf-8'
+BASE64_SOURCEMAP_PREAMBLE = 'data:application/json;base64,'
+BASE64_PREAMBLE_LENGTH = len(BASE64_SOURCEMAP_PREAMBLE)
 
 UrlResult = namedtuple('UrlResult', ['url', 'headers', 'body'])
+
+logger = logging.getLogger(__name__)
 
 
 def trim_line(line):
@@ -60,7 +70,7 @@ def get_source_context(source, lineno, context=LINES_OF_CONTEXT):
     return pre_context, context_line, post_context
 
 
-def discover_sourcemap(result, logger=None):
+def discover_sourcemap(result):
     """
     Given a UrlResult object, attempt to discover a sourcemap.
     """
@@ -80,7 +90,7 @@ def discover_sourcemap(result, logger=None):
             possibilities = set(parsed_body)
 
         for line in possibilities:
-            if line.startswith('//@ sourceMappingURL='):
+            if line.startswith('//@ sourceMappingURL=') or line.startswith('//# sourceMappingURL='):
                 # We want everything AFTER the indicator, which is 21 chars long
                 sourcemap = line[21:].rstrip()
                 break
@@ -92,23 +102,19 @@ def discover_sourcemap(result, logger=None):
     return sourcemap
 
 
-def fetch_url(url, logger=None):
+def fetch_url_content(url):
     """
-    Pull down a URL, returning a UrlResult object.
-
-    Attempts to fetch from the cache.
+    Pull down a URL, returning a tuple (url, headers, body).
     """
     import sentry
 
-    cache_key = 'fetch_url:%s' % (hashlib.md5(url).hexdigest(),)
-    result = cache.get(cache_key)
-    if result is not None:
-        return result
-
     try:
         opener = urllib2.build_opener()
-        opener.addheaders = [('User-Agent', 'Sentry/%s' % sentry.VERSION)]
-        req = opener.open(url)
+        opener.addheaders = [
+            ('Accept-Encoding', 'gzip'),
+            ('User-Agent', 'Sentry/%s' % sentry.VERSION),
+        ]
+        req = opener.open(url, timeout=SOURCE_FETCH_TIMEOUT)
         headers = dict(req.headers)
         body = req.read()
         if headers.get('content-encoding') == 'gzip':
@@ -116,25 +122,57 @@ def fetch_url(url, logger=None):
             # and may send gzipped data regardless.
             # See: http://stackoverflow.com/questions/2423866/python-decompressing-gzip-chunk-by-chunk/2424549#2424549
             body = zlib.decompress(body, 16 + zlib.MAX_WBITS)
-        body = body.rstrip('\n')
+
+        try:
+            content_type = headers['content-type']
+        except KeyError:
+            # If there is no content_type header at all, quickly assume default utf-8 encoding
+            encoding = DEFAULT_ENCODING
+        else:
+            try:
+                encoding = CHARSET_RE.search(content_type).group(1)
+            except AttributeError:
+                encoding = DEFAULT_ENCODING
+
+        body = body.decode(encoding).rstrip('\n')
     except Exception:
-        if logger:
-            logger.error('Unable to fetch remote source for %r', url, exc_info=True)
+        logging.info('Failed fetching %r', url, exc_info=True)
         return BAD_SOURCE
 
-    result = UrlResult(url, headers, body)
-
-    cache.set(cache_key, result, 60 * 5)
-
-    return result
+    return (url, headers, body)
 
 
-def fetch_sourcemap(url, logger=None):
-    result = fetch_url(url, logger=logger)
+def fetch_url(url):
+    """
+    Pull down a URL, returning a UrlResult object.
+
+    Attempts to fetch from the cache.
+    """
+
+    cache_key = 'fetch_url:v2:%s' % (
+        hashlib.md5(url.encode('utf-8')).hexdigest(),)
+    result = cache.get(cache_key)
+    if result is None:
+        result = fetch_url_content(url)
+
+        cache.set(cache_key, result, 30)
+
     if result == BAD_SOURCE:
-        return
+        return result
 
-    body = result.body
+    return UrlResult(*result)
+
+
+def fetch_sourcemap(url):
+    if is_data_uri(url):
+        body = base64.b64decode(url[BASE64_PREAMBLE_LENGTH:])
+    else:
+        result = fetch_url(url)
+        if result == BAD_SOURCE:
+            return
+
+        body = result.body
+
     # According to spec (https://docs.google.com/document/d/1U1RGAehQwRypUTovF1KRlpiOFze0b-_2gc6fAH0KY0k/edit#heading=h.h7yy76c5il9v)
     # A SourceMap may be prepended with ")]}'" to cause a Javascript error.
     # If the file starts with that string, ignore the entire first line.
@@ -142,16 +180,17 @@ def fetch_sourcemap(url, logger=None):
         body = body.split('\n', 1)[1]
     try:
         index = sourcemap_to_index(body)
-    except JSONDecodeError:
-        if logger:
-            logger.warning('Failed parsing sourcemap JSON: %r', body[:15],
-            exc_info=True)
+    except (JSONDecodeError, ValueError):
+        return
     else:
         return index
 
 
-@task(ignore_result=True)
-def fetch_javascript_source(event, **kwargs):
+def is_data_uri(url):
+    return url[:BASE64_PREAMBLE_LENGTH] == BASE64_SOURCEMAP_PREAMBLE
+
+
+def expand_javascript_source(data, **kwargs):
     """
     Attempt to fetch source code for javascript frames.
 
@@ -161,67 +200,101 @@ def fetch_javascript_source(event, **kwargs):
     - colno >= 0
     - abs_path is the HTTP URI to the source
     - context_line is empty
+
+    Mutates the input ``data`` with expanded context if available.
     """
-    logger = fetch_javascript_source.get_logger()
+    from sentry.interfaces import Stacktrace
 
     try:
-        stacktrace = event.interfaces['sentry.interfaces.Stacktrace']
+        stacktraces = [
+            Stacktrace(**e['stacktrace'])
+            for e in data['sentry.interfaces.Exception']['values']
+            if e.get('stacktrace')
+        ]
     except KeyError:
-        logger.debug('No stacktrace for event %r', event.id)
+        stacktraces = []
+
+    if not stacktraces:
+        logger.debug('No stacktrace for event %r', data['event_id'])
         return
 
     # build list of frames that we can actually grab source for
-    frames = [f for f in stacktrace.frames
-        if f.lineno is not None
-            and f.context_line is None
-            and f.is_url()]
-    if not frames:
-        logger.debug('Event %r has no frames with enough context to fetch remote source', event.id)
-        return
+    frames = []
+    for stacktrace in stacktraces:
+        frames.extend([
+            f for f in stacktrace.frames
+            if f.lineno is not None
+            and f.is_url()
+        ])
 
-    file_list = set()
+    if not frames:
+        logger.debug('Event %r has no frames with enough context to fetch remote source', data['event_id'])
+        return data
+
+    pending_file_list = set()
+    done_file_list = set()
     sourcemap_capable = set()
     source_code = {}
-    sourcemaps = {}
+    sourmap_idxs = {}
 
     for f in frames:
-        file_list.add(f.abs_path)
+        pending_file_list.add(f.abs_path)
         if f.colno is not None:
             sourcemap_capable.add(f.abs_path)
 
-    while file_list:
-        filename = file_list.pop()
+    while pending_file_list:
+        filename = pending_file_list.pop()
+        done_file_list.add(filename)
 
         # TODO: respect cache-contro/max-age headers to some extent
         logger.debug('Fetching remote source %r', filename)
         result = fetch_url(filename)
 
         if result == BAD_SOURCE:
+            logger.debug('Bad source file %r', filename)
             continue
 
         # If we didn't have a colno, a sourcemap wont do us any good
         if filename not in sourcemap_capable:
+            logger.debug('Not capable of sourcemap: %r', filename)
             source_code[filename] = (result.body.splitlines(), None)
             continue
 
+        sourcemap = discover_sourcemap(result)
+
         # TODO: we're currently running splitlines twice
-        sourcemap = discover_sourcemap(result, logger=logger)
-        source_code[filename] = (result.body.splitlines(), sourcemap)
-        if sourcemap:
-            logger.debug('Found sourcemap %r for minified script %r', sourcemap, result.url)
+        if not sourcemap:
+            source_code[filename] = (result.body.splitlines(), None)
+            continue
+        else:
+            logger.debug('Found sourcemap %r for minified script %r', sourcemap[:256], result.url)
+
+        sourcemap_key = hashlib.md5(sourcemap).hexdigest()
+        source_code[filename] = (result.body.splitlines(), sourcemap_key)
+
+        if sourcemap in sourmap_idxs:
+            continue
 
         # pull down sourcemap
-        if sourcemap and sourcemap not in sourcemaps:
-            index = fetch_sourcemap(sourcemap, logger=logger)
-            if not index:
-                continue
+        index = fetch_sourcemap(sourcemap)
+        if not index:
+            logger.debug('Failed parsing sourcemap index: %r', sourcemap[:15])
+            continue
 
-            sourcemaps[sourcemap] = index
+        if is_data_uri(sourcemap):
+            sourmap_idxs[sourcemap_key] = (index, result.url)
+        else:
+            sourmap_idxs[sourcemap_key] = (index, sourcemap)
 
-            # queue up additional source files for download
-            for source in index.sources:
-                if source not in source_code:
-                    file_list.add(urljoin(result.url, source))
+        # queue up additional source files for download
+        for source in index.sources:
+            next_filename = urljoin(result.url, source)
+            if next_filename not in done_file_list:
+                if index.content:
+                    source_code[next_filename] = (index.content[source], None)
+                    done_file_list.add(next_filename)
+                else:
+                    pending_file_list.add(next_filename)
 
     has_changes = False
     for frame in frames:
@@ -232,23 +305,26 @@ def fetch_javascript_source(event, **kwargs):
             continue
 
         # may have had a failure pulling down the sourcemap previously
-        if sourcemap in sourcemaps and frame.colno is not None:
-            state = find_source(sourcemaps[sourcemap], frame.lineno, frame.colno)
-            # TODO: is this urljoin right? (is it relative to the sourcemap or the originating file)
-            abs_path = urljoin(sourcemap, state.src)
+        if sourcemap in sourmap_idxs and frame.colno is not None:
+            index, relative_to = sourmap_idxs[sourcemap]
+            state = find_source(index, frame.lineno, frame.colno)
+            abs_path = urljoin(relative_to, state.src)
             logger.debug('Mapping compressed source %r to mapping in %r', frame.abs_path, abs_path)
             try:
                 source, _ = source_code[abs_path]
             except KeyError:
-                pass
+                frame.data = {
+                    'sourcemap': sourcemap,
+                }
+                logger.debug('Failed mapping path %r', abs_path)
             else:
                 # Store original data in annotation
                 frame.data = {
-                    'orig_lineno': frame['lineno'],
-                    'orig_colno': frame['colno'],
-                    'orig_function': frame['function'],
-                    'orig_abs_path': frame['abs_path'],
-                    'orig_filename': frame['filename'],
+                    'orig_lineno': frame.lineno,
+                    'orig_colno': frame.colno,
+                    'orig_function': frame.function,
+                    'orig_abs_path': frame.abs_path,
+                    'orig_filename': frame.filename,
                     'sourcemap': sourcemap,
                 }
 
@@ -266,5 +342,6 @@ def fetch_javascript_source(event, **kwargs):
             source=source, lineno=frame.lineno)
 
     if has_changes:
-        event.data['sentry.interfaces.Stacktrace'] = stacktrace.serialize()
-        event.update(data=event.data)
+        logger.debug('Updating stacktraces with expanded source context')
+        for exception, stacktrace in itertools.izip(data['sentry.interfaces.Exception']['values'], stacktraces):
+            exception['stacktrace'] = stacktrace.serialize()

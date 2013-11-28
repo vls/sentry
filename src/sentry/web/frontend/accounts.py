@@ -5,7 +5,8 @@ sentry.web.frontend.accounts
 :copyright: (c) 2012 by the Sentry Team, see AUTHORS for more details.
 :license: BSD, see LICENSE for more details.
 """
-from django.conf import settings as dj_settings
+import itertools
+
 from django.contrib import messages
 from django.contrib.auth import login as login_user, authenticate
 from django.core.context_processors import csrf
@@ -16,11 +17,14 @@ from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_protect
 from django.utils import timezone
 
-from sentry.models import UserOption, LostPasswordHash
+from sentry.constants import MEMBER_USER
+from sentry.models import Project, UserOption, LostPasswordHash
 from sentry.plugins import plugins
 from sentry.web.decorators import login_required
-from sentry.web.forms.accounts import AccountSettingsForm, NotificationSettingsForm, \
-  AppearanceSettingsForm, RegistrationForm, RecoverPasswordForm, ChangePasswordRecoverForm
+from sentry.web.forms.accounts import (
+    AccountSettingsForm, NotificationSettingsForm, AppearanceSettingsForm,
+    RegistrationForm, RecoverPasswordForm, ChangePasswordRecoverForm,
+    ProjectEmailOptionsForm)
 from sentry.web.helpers import render_to_response
 from sentry.utils.auth import get_auth_providers
 from sentry.utils.safe import safe_execute
@@ -29,8 +33,8 @@ from sentry.utils.safe import safe_execute
 @csrf_protect
 @never_cache
 def login(request):
+    from django.conf import settings
     from django.contrib.auth.forms import AuthenticationForm
-    from sentry.conf import settings
 
     if request.user.is_authenticated():
         return login_redirect(request)
@@ -46,9 +50,9 @@ def login(request):
     context.update({
         'form': form,
         'next': request.session.get('_next'),
-        'CAN_REGISTER': settings.ALLOW_REGISTRATION or request.session.get('can_register'),
+        'CAN_REGISTER': settings.SENTRY_ALLOW_REGISTRATION or request.session.get('can_register'),
         'AUTH_PROVIDERS': get_auth_providers(),
-        'SOCIAL_AUTH_CREATE_USERS': dj_settings.SOCIAL_AUTH_CREATE_USERS,
+        'SOCIAL_AUTH_CREATE_USERS': settings.SOCIAL_AUTH_CREATE_USERS,
     })
     return render_to_response('sentry/login.html', context, request)
 
@@ -57,9 +61,9 @@ def login(request):
 @never_cache
 @transaction.commit_on_success
 def register(request):
-    from sentry.conf import settings
+    from django.conf import settings
 
-    if not (settings.ALLOW_REGISTRATION or request.session.get('can_register')):
+    if not (settings.SENTRY_ALLOW_REGISTRATION or request.session.get('can_register')):
         return HttpResponseRedirect(reverse('sentry'))
 
     form = RegistrationForm(request.POST or None)
@@ -70,7 +74,7 @@ def register(request):
         request.session.pop('can_register', None)
 
         # HACK: grab whatever the first backend is and assume it works
-        user.backend = dj_settings.AUTHENTICATION_BACKENDS[0]
+        user.backend = settings.AUTHENTICATION_BACKENDS[0]
 
         login_user(request, user)
 
@@ -79,7 +83,7 @@ def register(request):
     return render_to_response('sentry/register.html', {
         'form': form,
         'AUTH_PROVIDERS': get_auth_providers(),
-        'SOCIAL_AUTH_CREATE_USERS': dj_settings.SOCIAL_AUTH_CREATE_USERS,
+        'SOCIAL_AUTH_CREATE_USERS': settings.SOCIAL_AUTH_CREATE_USERS,
     }, request)
 
 
@@ -110,12 +114,8 @@ def recover(request):
             user=form.cleaned_data['user']
         )
         if not password_hash.is_valid():
-            created = True
             password_hash.date_added = timezone.now()
             password_hash.set_hash()
-
-        if not created:
-            form.errors['__all__'] = ['A password reset was already attempted for this account within the last 24 hours.']
 
     if form.is_valid():
         password_hash.send_recover_mail()
@@ -199,11 +199,14 @@ def settings(request):
 @login_required
 @transaction.commit_on_success
 def appearance_settings(request):
+    from django.conf import settings
+
     options = UserOption.objects.get_all_values(user=request.user, project=None)
 
     form = AppearanceSettingsForm(request.user, request.POST or None, initial={
         'language': options.get('language') or request.LANGUAGE_CODE,
         'stacktrace_order': int(options.get('stacktrace_order', -1) or -1),
+        'timezone': options.get('timezone') or settings.TIME_ZONE,
     })
     if form.is_valid():
         form.save()
@@ -223,29 +226,41 @@ def appearance_settings(request):
 @login_required
 @transaction.commit_on_success
 def notification_settings(request):
-    forms = []
+    settings_form = NotificationSettingsForm(request.user, request.POST or None)
+
+    project_list = Project.objects.get_for_user(request.user, access=MEMBER_USER)
+    project_forms = [
+        (project, ProjectEmailOptionsForm(
+            project, request.user,
+            request.POST or None,
+            prefix='project-%s' % (project.id,)
+        ))
+        for project in sorted(project_list, key=lambda x: (x.team.name, x.name))
+    ]
+
+    ext_forms = []
     for plugin in plugins.all():
         for form in safe_execute(plugin.get_notification_forms) or ():
-            form = safe_execute(form, plugin, request.user, request.POST or None)
+            form = safe_execute(form, plugin, request.user, request.POST or None, prefix=plugin.slug)
             if not form:
                 continue
-            forms.append(form)
-
-    # Ensure our form comes first
-    forms = [
-        NotificationSettingsForm(request.user, request.POST or None),
-    ] + forms
+            ext_forms.append(form)
 
     if request.POST:
-        if all(f.is_valid() for f in forms):
-            for form in forms:
+        all_forms = list(itertools.chain(
+            [settings_form], ext_forms, (f for _, f in project_forms)
+        ))
+        if all(f.is_valid() for f in all_forms):
+            for form in all_forms:
                 form.save()
             messages.add_message(request, messages.SUCCESS, 'Your settings were saved.')
             return HttpResponseRedirect(request.path)
 
     context = csrf(request)
     context.update({
-        'forms': forms,
+        'settings_form': settings_form,
+        'project_forms': project_forms,
+        'ext_forms': ext_forms,
         'page': 'notifications',
     })
     return render_to_response('sentry/account/notifications.html', context, request)

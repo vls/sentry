@@ -7,18 +7,12 @@ sentry.utils.cache
 """
 import functools
 import logging
+import random
 import time
 
-from django.core.cache import get_cache, cache as default_cache
+from django.core.cache import cache
 
-from sentry.conf import settings
-
-if settings.CACHE_BACKEND != 'default':
-    _cache = get_cache(settings.CACHE_BACKEND)  # NOQA
-else:
-    _cache = default_cache
-
-cache = _cache
+default_cache = cache
 
 logger = logging.getLogger(__name__)
 
@@ -34,20 +28,20 @@ class Lock(object):
     >>> with Lock('key name'):
     >>>     # do something
     """
-    def __init__(self, lock_key, timeout=10, cache=None):
+    def __init__(self, lock_key, timeout=3, cache=None, nowait=False):
         if cache is None:
-            self.cache = _cache
+            self.cache = default_cache
         else:
             self.cache = cache
         self.timeout = timeout
         self.lock_key = lock_key
+        self.nowait = nowait
 
     def __enter__(self):
-        start = time.time()
         lock_key = self.lock_key
         cache = self.cache
 
-        delay = 0.1
+        delay = 0.01 + random.random() / 10
         attempt = 0
         max_attempts = self.timeout / delay
         got_lock = None
@@ -55,12 +49,14 @@ class Lock(object):
         while not got_lock and attempt < max_attempts:
             got_lock = cache.add(lock_key, '', self.timeout)
             if not got_lock:
+                if self.nowait:
+                    break
                 self.was_locked = True
                 time.sleep(delay)
                 attempt += 1
 
         if not got_lock:
-            raise UnableToGetLock('Unable to fetch lock after %.2fs' % (time.time() - start,))
+            raise UnableToGetLock('Unable to fetch lock after on %s' % (lock_key,))
 
         return self
 

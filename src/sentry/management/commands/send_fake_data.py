@@ -11,7 +11,7 @@ import itertools
 import random
 import time
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, make_option
 
 
 def funcs():
@@ -39,7 +39,7 @@ def funcs():
             raise exceptions.next()
         except Exception:
             email = emails.next()
-            return client.capture('Exception', data={
+            return client.captureException(data={
                 'logger': loggers.next(),
                 'site': 'web',
                 'sentry.interfaces.User': {
@@ -52,23 +52,44 @@ def funcs():
 
 
 class Command(BaseCommand):
-    help = 'Performs any pending database migrations and upgrades'
+    help = 'Sends fake data to the internal Sentry project'
+
+    option_list = BaseCommand.option_list + (
+        make_option('--num', dest='num_events', type=int),
+    )
 
     def handle(self, **options):
         from raven.contrib.django.models import client
 
+        self.stdout.write('Preparing to send events. Ctrl-C to exit.')
+
+        time.sleep(2)
+
         functions = funcs()
+
+        if options['num_events']:
+            max_events = options['num_events']
+        else:
+            max_events = -1
 
         s = time.time()
         r = 0
         try:
             while True:
+                if r == max_events:
+                    break
+                if options['verbosity'] > 1:
+                    self.stdout.write('Sending event..\n')
                 random.choice(functions)(client)
                 r += 1
         except KeyboardInterrupt:
             pass
         finally:
             total_time = time.time() - s
-            print '%d requests serviced in %.3fs' % (r, total_time)
-            avg = total_time / r
-            print 'avg of %.3fs/req, %d req/s' % (avg, 1 / avg)
+            self.stdout.write('%d requests serviced in %.3fs\n' % (r, total_time))
+            if r:
+                avg = total_time / r
+                ravg = 1 / avg
+            else:
+                avg = ravg = 0
+            self.stdout.write('avg of %.3fs/req, %d req/s\n' % (avg, ravg))

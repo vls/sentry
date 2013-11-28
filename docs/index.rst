@@ -6,6 +6,11 @@ specializes in monitoring errors and extracting all the information needed
 to do a proper post-mortem without any of the hassle of the standard user
 feedback loop.
 
+It's important to note that Sentry should not be thought of as a log stream,
+but as an event aggregator. It fits somewhere in-between a simple metrics
+solution (such as `Graphite <http://graphite.wikidot.com/>`_) and a full-on
+log stream aggregator (like `Logstash <http://logstash.net/>`_).
+
 Users Guide
 -----------
 
@@ -13,14 +18,19 @@ Users Guide
    :maxdepth: 2
 
    quickstart/index
+   quickstart/nginx
    upgrading/index
    config/index
    queue/index
    buffer/index
+   nodestore/index
    udp_server/index
+   throttling/index
+   performance/index
    cli/index
    client/index
    plugins/index
+   faq/index
 
 Developers
 ----------
@@ -45,7 +55,7 @@ Reference
 Resources
 ---------
 
-* `Transifex <https://www.transifex.net/projects/p/sentry/>`_ (Translate Sentry!)
+* `Transifex <https://www.transifex.com/projects/p/sentry/>`_ (Translate Sentry!)
 * `Bug Tracker <http://github.com/getsentry/sentry/issues>`_
 * `Code <http://github.com/getsentry/sentry>`_
 * `Mailing List <https://groups.google.com/group/getsentry>`_

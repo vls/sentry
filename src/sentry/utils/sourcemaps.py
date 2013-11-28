@@ -9,12 +9,15 @@ Originally based on https://github.com/martine/python-sourcemap
 """
 
 import bisect
+
 from collections import namedtuple
+from urlparse import urljoin
+
 from sentry.utils import json
 
 
 SourceMap = namedtuple('SourceMap', ['dst_line', 'dst_col', 'src', 'src_line', 'src_col', 'name'])
-SourceMapIndex = namedtuple('SourceMapIndex', ['states', 'keys', 'sources'])
+SourceMapIndex = namedtuple('SourceMapIndex', ['states', 'keys', 'sources', 'content'])
 
 # Mapping of base64 letter -> integer value.
 B64 = dict(
@@ -56,12 +59,10 @@ def parse_vlq(segment):
     return values
 
 
-def parse_sourcemap(sourcemap):
+def parse_sourcemap(smap):
     """
-    Given a file-like object, yield SourceMap objects as they are read from it.
+    Given a sourcemap json object, yield SourceMap objects as they are read from it.
     """
-
-    smap = json.loads(sourcemap)
     sources = smap['sources']
     sourceRoot = smap.get('sourceRoot')
     names = smap['names']
@@ -70,7 +71,7 @@ def parse_sourcemap(sourcemap):
 
     if sourceRoot:
         sources = [
-            '%s/%s' % (sourceRoot, src)
+            urljoin(sourceRoot, src)
             for src in sources
         ]
 
@@ -105,16 +106,27 @@ def parse_sourcemap(sourcemap):
 
 
 def sourcemap_to_index(sourcemap):
+    smap = json.loads(sourcemap)
+
     state_list = []
     key_list = []
     src_list = set()
+    content = None
 
-    for state in parse_sourcemap(sourcemap):
+    if 'sourcesContent' in smap:
+        content = {}
+        for idx, source in enumerate(smap['sources']):
+            if smap['sourcesContent'][idx]:
+                content[source] = smap['sourcesContent'][idx].splitlines()
+            else:
+                content[source] = []
+
+    for state in parse_sourcemap(smap):
         state_list.append(state)
         key_list.append((state.dst_line, state.dst_col))
         src_list.add(state.src)
 
-    return SourceMapIndex(state_list, key_list, src_list)
+    return SourceMapIndex(state_list, key_list, src_list, content)
 
 
 def find_source(indexed_sourcemap, lineno, colno):
